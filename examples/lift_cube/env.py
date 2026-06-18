@@ -1,0 +1,696 @@
+import math
+from functools import partial
+from typing import Literal
+
+import torch
+from tensordict import TensorDict
+
+import genesis as gs
+from genesis.options.sensors import BatchRendererCameraOptions, RasterizerCameraOptions
+from genesis.vis.camera import Camera
+from genesis.utils.geom import (
+    xyz_to_quat,
+    transform_quat_by_quat,
+    transform_by_trans_quat,
+)
+
+try:
+    import gs_madrona
+
+    _ENABLE_MADRONA = True
+except ImportError:
+    _ENABLE_MADRONA = False
+
+
+class GraspEnv:
+    def __init__(
+        self,
+        env_cfg: dict,
+        reward_cfg: dict,
+        robot_cfg: dict,
+        show_viewer: bool = False,
+    ) -> None:
+        self.num_envs = env_cfg["num_envs"]
+        self.num_actions = env_cfg["num_actions"]
+        self.cfg = env_cfg
+        self.device = gs.device
+
+        self.ctrl_dt = env_cfg["ctrl_dt"]
+        self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.ctrl_dt)
+
+        # configs
+        self.env_cfg = env_cfg
+        self.reward_scales = reward_cfg
+        self.action_scales = torch.tensor(env_cfg["action_scales"], device=self.device)
+
+        # camera config
+        self.image_width = env_cfg["image_resolution"][0]
+        self.image_height = env_cfg["image_resolution"][1]
+        self.rgb_image_shape = (3, self.image_height, self.image_width)
+
+        # == determine which environments to render ==
+        # Genesisは環境を ceil(sqrt(n_envs)) のグリッドで原点を中心に配置します。
+        # 2048環境の場合、46x46のグリッドとなり、env 0 は (-22.5, -22.5) 付近に配置されます。
+        # 原点 (0,0) に最も近い環境は、行23、列23付近のインデックスになります。
+        grid_size = int(math.ceil(math.sqrt(self.num_envs)))
+        if self.num_envs <= 10:
+            rendered_envs_idx = list(range(self.num_envs))
+        else:
+            # グリッドの中心にある環境のインデックスを計算
+            center_r = grid_size // 2
+            center_c = grid_size // 2
+            origin_env_idx = center_r * grid_size + center_c
+            # 原点を中心としてY軸の負から正へ10個を描画（-5 ～ +4）
+            rendered_envs_idx = list(range(origin_env_idx - 5, origin_env_idx + 5))
+
+        # == setup scene ==
+        self.scene = gs.Scene(
+            sim_options=gs.options.SimOptions(dt=self.ctrl_dt, substeps=2),
+            rigid_options=gs.options.RigidOptions(
+                dt=self.ctrl_dt,
+                constraint_solver=gs.constraint_solver.Newton,
+                enable_collision=True,
+                enable_joint_limit=True,
+            ),
+            vis_options=gs.options.VisOptions(
+                rendered_envs_idx=rendered_envs_idx, # 中央の10個を描画
+                # rendered_envs_idx=list(range(min(10, self.num_envs))), # 端から10個を描画（元のコード）
+                env_separate_rigid=True,
+            ),
+            viewer_options=gs.options.ViewerOptions(
+                res=(1280, 960),
+                camera_pos=(2.5, -1.0, 2.5),
+                camera_lookat=(0.5, -0.3, 0.1),
+                camera_fov=55,
+            ),
+            profiling_options=gs.options.ProfilingOptions(show_FPS=False),
+            show_viewer=show_viewer,
+        )
+
+        # == add ground ==
+        self.scene.add_entity(
+            gs.morphs.Plane(),
+            # gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True),
+        )
+
+        # == add robot ==
+        self.robot = Manipulator(
+            num_envs=self.num_envs,
+            scene=self.scene,
+            args=robot_cfg,
+            device=gs.device,
+        )
+
+        # == add object ==
+        self.object = self.scene.add_entity(
+            gs.morphs.Box(
+                size=env_cfg["box_size"],
+                fixed=env_cfg.get("box_fixed", True),
+                batch_fixed_verts=True,
+            ),
+            surface=gs.surfaces.Rough(
+                diffuse_texture=gs.textures.ColorTexture(
+                    # color=(1.0, 0.0, 0.0),
+                    color=(28/255, 95/255, 197/255),
+                ),
+            ),
+        )
+
+        # == add target region ==
+        self.target_region = self.scene.add_entity(
+            gs.morphs.Box(
+                size=[0.1, 0.1, 0.001],
+                fixed=True,
+                batch_fixed_verts=True,
+            ),
+            surface=gs.surfaces.Rough(
+                diffuse_texture=gs.textures.ColorTexture(
+                    color=(0.0, 1.0, 0.0),
+                ),
+            ),
+        )
+
+        # == add finger tip visualization ==
+        self.finger_tip_vis = self.scene.add_entity(
+            gs.morphs.Sphere(
+                radius=0.015,
+                fixed=True,
+                batch_fixed_verts=True,
+            ),
+            surface=gs.surfaces.Rough(
+                diffuse_texture=gs.textures.ColorTexture(
+                    color=(0.0, 0.0, 1.0),
+                ),
+            ),
+        )
+
+        # == visualization camera (debug only, uses scene camera API) ==
+        if self.env_cfg.get("visualize_camera", False):
+            self.vis_cam = self.scene.add_camera(
+                res=(1280, 960),
+                pos=(2.5, -1.0, 2.5),  # ViewerOptionsのcamera_posに合わせる
+                lookat=(0.5, -0.3, 0.1), # ViewerOptionsのcamera_lookatに合わせる
+                fov=55,
+                GUI=False,
+                debug=True,
+            )
+
+        # == stereo camera sensors (lazy rendering — zero cost until read()) ==
+        if _ENABLE_MADRONA and gs.backend == gs.cuda:
+            CameraOptions = BatchRendererCameraOptions
+            cam_kwargs = dict(use_rasterizer=True)
+        else:
+            CameraOptions = RasterizerCameraOptions
+            cam_kwargs = {}
+
+        self.left_cam = self.scene.add_sensor(
+            CameraOptions(
+                res=(self.image_width, self.image_height),
+                pos=(1.25, 0.3, 0.3),
+                lookat=(0.0, 0.0, 0.0),
+                fov=60,
+                **cam_kwargs,
+            )
+        )
+        self.right_cam = self.scene.add_sensor(
+            CameraOptions(
+                res=(self.image_width, self.image_height),
+                pos=(1.25, -0.3, 0.3),
+                lookat=(0.0, 0.0, 0.0),
+                fov=60,
+                **cam_kwargs,
+            )
+        )
+
+        # == camera data readers ==
+        def _read_scene_cam(cam):
+            rgb = cam.render(rgb=True)[0]
+            if rgb.ndim == 4:
+                rgb = rgb[0]
+            return rgb[..., :3]
+
+        def _read_sensor_cam(cam):
+            return cam.read(envs_idx=0).rgb
+
+        # Debug live preview of sensor cameras
+        if self.env_cfg.get("visualize_camera", False):
+            self.scene.start_recording(
+                data_func=partial(_read_sensor_cam, self.left_cam),
+                rec_options=gs.recorders.MPLImagePlot(title="Left Camera"),
+            )
+            self.scene.start_recording(
+                data_func=partial(_read_sensor_cam, self.right_cam),
+                rec_options=gs.recorders.MPLImagePlot(title="Right Camera"),
+            )
+
+        # == set up video recording (must be before build) ==
+
+        record_video = env_cfg.get("record_video", {})
+        for cam_name, filename in record_video.items():
+            cam = getattr(self, cam_name)
+            reader = _read_scene_cam if isinstance(cam, Camera) else _read_sensor_cam
+            self.scene.start_recording(
+                data_func=partial(reader, cam),
+                rec_options=gs.recorders.VideoFile(filename=filename),
+            )
+
+        # build
+        self.scene.build(n_envs=env_cfg["num_envs"], env_spacing=(1.0, 1.0))
+        # set pd gains (must be called after scene.build)
+        self.robot.set_pd_gains()
+
+        # prepare reward functions and multiply reward scales by dt
+        self.reward_functions, self.episode_sums = dict(), dict()
+        for name in self.reward_scales.keys():
+            self.reward_scales[name] *= self.ctrl_dt
+            self.reward_functions[name] = getattr(self, "_reward_" + name)
+            self.episode_sums[name] = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+
+        self.keypoints_offset = self.get_keypoint_offsets(batch_size=self.num_envs, device=self.device, unit_length=0.5)
+        # == init buffers ==
+        self._init_buffers()
+        self.reset()
+
+    def _init_buffers(self) -> None:
+        self.episode_length_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
+        self.reset_buf = torch.ones(self.num_envs, dtype=gs.tc_bool, device=gs.device)
+        self.goal_pose = torch.zeros(self.num_envs, 7, device=gs.device, dtype=gs.tc_float)
+        self.target_pos = torch.zeros(self.num_envs, 3, device=gs.device, dtype=gs.tc_float)
+        self.prev_height = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.prev_actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
+        self.current_actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
+        self.extras = dict()
+
+    def _reset_idx(self, envs_idx=None) -> None:
+        """Reset specified environments.
+
+        Parameters
+        ----------
+        envs_idx : torch.Tensor or None
+            Boolean mask of shape (num_envs,) for selective reset, or None for full reset.
+        """
+        # Reset robot
+        self.robot.reset(envs_idx)
+
+        # Generate random object state for all envs
+        random_x = torch.rand(self.num_envs, device=self.device) * 0.2 + 0.1
+        random_y = (torch.rand(self.num_envs, device=self.device) - 0.5) * 0.5
+        random_z = torch.full((self.num_envs,), 0.015, device=self.device)
+        random_pos = torch.stack([random_x, random_y, random_z], dim=-1)
+
+        q_downward = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, -1)
+        random_yaw = (torch.rand(self.num_envs, device=self.device) * 2 * math.pi - math.pi) * 0.25
+        q_yaw = torch.stack(
+            [
+                torch.cos(random_yaw / 2),
+                torch.zeros(self.num_envs, device=self.device),
+                torch.zeros(self.num_envs, device=self.device),
+                torch.sin(random_yaw / 2),
+            ],
+            dim=-1,
+        )
+        goal_yaw = transform_quat_by_quat(q_yaw, q_downward)
+        goal_pose = torch.cat([random_pos, goal_yaw], dim=-1)
+
+        # Generate random target region state for all envs
+        # Put target region on the other half (x: 0.4~0.6, y: -0.4~0.4)
+        random_tx = torch.rand(self.num_envs, device=self.device) * 0.2 + 0.4
+        random_ty = (torch.rand(self.num_envs, device=self.device) - 0.5) * 0.8
+        random_tz = torch.full((self.num_envs,), 0.0005, device=self.device)
+        random_tpos = torch.stack([random_tx, random_ty, random_tz], dim=-1)
+
+        # Reset object — set_pos/set_quat with skip_forward, then FK runs once for everything
+        if envs_idx is None:
+            self.target_pos.copy_(random_tpos)
+            self.target_region.set_pos(random_tpos, skip_forward=True)
+            self.prev_height.fill_(0.015)
+            self.prev_actions.zero_()
+            
+            self.goal_pose.copy_(goal_pose)
+            self.object.set_pos(random_pos, skip_forward=True)
+            self.object.set_quat(goal_yaw, skip_forward=False)
+            self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], skip_forward=True)
+            self.episode_length_buf.zero_()
+            self.reset_buf.fill_(True)
+        else:
+            torch.where(envs_idx[:, None], random_tpos, self.target_pos, out=self.target_pos)
+            self.target_region.set_pos(random_tpos, envs_idx=envs_idx, skip_forward=True)
+            self.prev_height.masked_fill_(envs_idx, 0.015)
+            self.prev_actions[envs_idx] = 0.0
+            
+            torch.where(envs_idx[:, None], goal_pose, self.goal_pose, out=self.goal_pose)
+            self.object.set_pos(random_pos, envs_idx=envs_idx, skip_forward=True)
+            self.object.set_quat(goal_yaw, envs_idx=envs_idx, skip_forward=False)
+            self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], envs_idx=envs_idx, skip_forward=True)
+            self.episode_length_buf.masked_fill_(envs_idx, 0)
+            self.reset_buf.masked_fill_(envs_idx, True)
+
+        # Invalidate camera caches after state change
+        self.left_cam._stale = True
+        self.right_cam._stale = True
+
+        # Fill extras
+        n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
+        self.extras["episode"] = {}
+        for key, value in self.episode_sums.items():
+            if envs_idx is None:
+                mean = value.mean()
+            else:
+                mean = torch.where(n_envs > 0, value[envs_idx].sum() / n_envs, 0.0)
+            self.extras["episode"]["rew_" + key] = mean / self.env_cfg["episode_length_s"]
+            if envs_idx is None:
+                value.zero_()
+            else:
+                value.masked_fill_(envs_idx, 0.0)
+
+    def reset(self) -> TensorDict:
+        self._reset_idx()
+        return self.get_observations()
+
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+        # apply action
+        actions = self.rescale_action(actions)
+        self.robot.apply_action(actions)
+        self.scene.step()
+
+        # update finger tip vis
+        self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], skip_forward=True)
+
+        # update time
+        self.episode_length_buf += 1
+
+        # check termination (bool mask)
+        self.reset_buf = self.episode_length_buf > self.max_episode_length
+        self.reset_buf |= self.scene.rigid_solver.get_error_envs_mask()
+
+        # timeout for value bootstrapping (only true timeouts, not NaN errors)
+        self.extras["time_outs"] = (self.episode_length_buf > self.max_episode_length).to(dtype=gs.tc_float)
+
+        self.current_actions = actions.clone()
+
+        # compute reward before reset (reflects terminal state)
+        reward = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        for name, reward_func in self.reward_functions.items():
+            rew = reward_func() * self.reward_scales[name]
+            reward += rew
+            self.episode_sums[name] += rew
+
+        # save state before reset
+        self.prev_actions = self.current_actions.clone()
+        self.prev_height = self.object.get_pos()[:, 2].clone()
+
+        # soft-reset envs that need it
+        self._reset_idx(self.reset_buf)
+
+        return self.get_observations(), reward, self.reset_buf, self.extras
+
+    def get_observations(self) -> TensorDict:
+        # Current end-effector pose
+        finger_pos, finger_quat = (
+            self.robot.finger_tip_pose[:, :3],
+            self.robot.finger_tip_pose[:, 3:7],
+        )
+        obj_pos, obj_quat = self.object.get_pos(), self.object.get_quat()
+        obs_components = [
+            finger_pos - obj_pos,  # 3D position difference
+            finger_quat,  # current orientation (w, x, y, z)
+            obj_pos,  # current object position
+            obj_quat,  # current object orientation (w, x, y, z)
+            self.target_pos - obj_pos, # vector to target
+        ]
+        self.obs_buf = torch.cat(obs_components, dim=-1)
+        return TensorDict({"policy": self.obs_buf}, batch_size=[self.num_envs])
+
+    def rescale_action(self, action: torch.Tensor) -> torch.Tensor:
+        return action * self.action_scales
+
+    def get_stereo_rgb_images(self, normalize: bool = True) -> torch.Tensor:
+        rgb_left = self.left_cam.read().rgb  # (B, H, W, 3)
+        rgb_right = self.right_cam.read().rgb  # (B, H, W, 3)
+
+        # Convert to (B, 3, H, W) float
+        rgb_left = rgb_left.permute(0, 3, 1, 2).float()
+        rgb_right = rgb_right.permute(0, 3, 1, 2).float()
+
+        if normalize:
+            rgb_left = rgb_left / 255.0
+            rgb_right = rgb_right / 255.0
+
+        # Concatenate left and right rgb images along channel dimension: [B, 6, H, W]
+        return torch.cat([rgb_left, rgb_right], dim=1)
+
+    # ------------ begin reward functions----------------
+    def _reward_reach_cube(self) -> torch.Tensor:
+        # 1. Reaching to the cube reward: 1 - tanh(d/sigma)
+        finger_pos = self.robot.finger_tip_pose[:, :3]
+        cube_pos = self.object.get_pos()
+        d = torch.norm(finger_pos - cube_pos, p=2, dim=-1)
+        sigma = 0.1
+        return 1.0 - torch.tanh(d / sigma)
+
+    def _reward_lift_cube(self) -> torch.Tensor:
+        # 2. Height reward: height > min_height
+        cube_pos = self.object.get_pos()
+        min_height = 0.025
+        
+        # 目標地點に近づいたからといって没収しないように dist > min_dist の条件を削除
+        reward = (cube_pos[:, 2] > min_height).to(dtype=gs.tc_float)
+        return reward
+
+    def _reward_reach_target(self) -> torch.Tensor:
+        # 3. Distance to the target region reward: 1 - tanh(d/sigma)
+        cube_pos = self.object.get_pos()
+        target_pos = self.target_pos
+        d = torch.norm(cube_pos[:, :2] - target_pos[:, :2], p=2, dim=-1)
+        sigma = 0.1
+        return 1.0 - torch.tanh(d / sigma)
+
+    def _reward_lower_cube(self) -> torch.Tensor:
+        # 4. Lowering the cube reward: dist < min_dist & height < prev_height
+        cube_pos = self.object.get_pos()
+        target_pos = self.target_pos
+        dist = torch.norm(cube_pos[:, :2] - target_pos[:, :2], p=2, dim=-1)
+        
+        min_dist = 0.03
+        
+        reward = ((dist < min_dist) & (cube_pos[:, 2] < self.prev_height)).to(dtype=gs.tc_float)
+        return reward
+
+    def _reward_release_cube(self) -> torch.Tensor:
+        # 5. Release cube reward: inside target & cube is on the floor & gripper is open
+        cube_pos = self.object.get_pos()
+        target_pos = self.target_pos
+        dist = torch.norm(cube_pos[:, :2] - target_pos[:, :2], p=2, dim=-1)
+        
+        # ターゲット内にあり、床に置かれているか
+        min_dist = 0.03
+        is_in_target = (dist < min_dist) & (cube_pos[:, 2] < 0.02)
+        
+        # グリッパーが開いているか
+        q_pos = self.robot._robot_entity.get_qpos()
+        gripper_pos = (q_pos[:, self.robot._left_finger_dof] + q_pos[:, self.robot._right_finger_dof]) / 2.0
+        normalized_open = (gripper_pos - self.robot._gripper_close_dof) / (self.robot._gripper_open_dof - self.robot._gripper_close_dof + 1e-6)
+        is_open = normalized_open > 0.5
+        
+        reward = (is_in_target & is_open).to(dtype=gs.tc_float)
+        return reward
+
+    def _reward_action_rate(self) -> torch.Tensor:
+        # 5. Action rate reward (penalty): (act - prev_act)^2
+        penalty = torch.sum(torch.square(self.current_actions - self.prev_actions), dim=-1)
+        return -penalty
+
+    def _reward_joint_vel(self) -> torch.Tensor:
+        # 6. Joint vel reward (penalty): (joint_vel)^2
+        joint_vel = self.robot._robot_entity.get_dofs_velocity()
+        penalty = torch.sum(torch.square(joint_vel), dim=-1)
+        return -penalty
+    # ------------ end reward functions----------------
+
+    @staticmethod
+    def _to_world_frame(
+        position: torch.Tensor,  # [B, 3]
+        quaternion: torch.Tensor,  # [B, 4]
+        keypoints_offset: torch.Tensor,  # [B, K, 3]
+    ) -> torch.Tensor:
+        return transform_by_trans_quat(keypoints_offset, position.unsqueeze(1), quaternion.unsqueeze(1))
+
+    @staticmethod
+    def get_keypoint_offsets(batch_size: int, device: str, unit_length: float = 0.5) -> torch.Tensor:
+        """
+        Get uniformly-spaced keypoints along a line of unit length, centered at body center.
+        """
+        keypoint_offsets = (
+            torch.tensor(
+                [
+                    [0, 0, 0],  # origin
+                    [-1.0, 0, 0],  # x-negative
+                    [1.0, 0, 0],  # x-positive
+                    [0, -1.0, 0],  # y-negative
+                    [0, 1.0, 0],  # y-positive
+                    [0, 0, -1.0],  # z-negative
+                    [0, 0, 1.0],  # z-positive
+                ],
+                device=device,
+                dtype=torch.float32,
+            )
+            * unit_length
+        )
+        return keypoint_offsets[None].repeat((batch_size, 1, 1))
+
+## ------------ robot ----------------
+class Manipulator:
+    def __init__(self, num_envs: int, scene: gs.Scene, args: dict, device: str = "cpu"):
+        # == set members ==
+        self._device = device
+        self._scene = scene
+        self._num_envs = num_envs
+        self._args = args
+
+        # == Genesis configurations ==
+        material: gs.materials.Rigid = gs.materials.Rigid()
+        morph: gs.morphs.MJCF = gs.morphs.MJCF(
+            file="/home/kmymch/ws/trossen_arm_mujoco/trossen_arm_mujoco/assets/wxai/wxai_follower.xml",
+            pos=(0.0, 0.0, 0.0),
+            quat=(1.0, 0.0, 0.0, 0.0),
+        )
+        self._robot_entity: gs.Entity = scene.add_entity(material=material, morph=morph)
+
+        self._gripper_open_dof = 0.044
+        self._gripper_close_dof = 0.00
+
+        self._ik_method: Literal["gs_ik", "dls_ik"] = args["ik_method"]
+
+        # == some buffer initialization ==
+        self._init()
+
+    def set_pd_gains(self):
+        # set control gains
+        # Note: the following values are tuned for achieving best behavior with Franka
+        # Typically, each new robot would have a different set of parameters.
+        # Sometimes high-quality URDF or XML file would also provide this and will be parsed.
+        self._robot_entity.set_dofs_kp(
+            torch.tensor([200, 200, 200, 100, 50, 50, 1000, 1000]),
+        )
+        self._robot_entity.set_dofs_kv(
+            torch.tensor([10, 10, 10, 5, 5, 5, 50, 50]),
+        )
+        self._robot_entity.set_dofs_force_range(
+            torch.tensor([-27, -27, -27, -7, -7, -7, -400, -400]),
+            torch.tensor([27, 27, 27, 7, 7, 7, 400, 400]),
+        )
+
+    def _init(self):
+        self._arm_dof_dim = self._robot_entity.n_dofs - 2  # total number of arm joints
+        self._gripper_dim = 2  # number of gripper joints
+
+        self._arm_dof_idx = torch.arange(self._arm_dof_dim, device=self._device)
+        self._fingers_dof = torch.arange(
+            self._arm_dof_dim,
+            self._arm_dof_dim + self._gripper_dim,
+            device=self._device,
+        )
+        self._left_finger_dof = self._fingers_dof[0]
+        self._right_finger_dof = self._fingers_dof[1]
+        self._ee_link = self._robot_entity.get_link(self._args["ee_link_name"])
+        self._left_finger_link = self._robot_entity.get_link(self._args["gripper_link_names"][0])
+        self._right_finger_link = self._robot_entity.get_link(self._args["gripper_link_names"][1])
+        self._default_joint_angles = self._args["default_arm_dof"]
+        if self._args["default_gripper_dof"] is not None:
+            self._default_joint_angles += self._args["default_gripper_dof"]
+        self._init_qpos = torch.tensor(self._default_joint_angles, dtype=torch.float32, device=self._device)
+        # On MPS/Metal, batched linear algebra is extremely slow due to per-element kernel dispatch.
+        # Running the DLS solve on CPU is ~300x faster in that case.
+        self._dls_solve_on_cpu = self._device == "mps" or str(self._device).startswith("mps")
+        dls_lam_device = "cpu" if self._dls_solve_on_cpu else self._device
+        self._dls_lambda_matrix = (0.01**2) * torch.eye(6, device=dls_lam_device)
+
+    def reset(self, envs_idx=None, skip_forward=True):
+        self._robot_entity.set_qpos(
+            self._init_qpos,
+            envs_idx=envs_idx,
+            zero_velocity=True,
+            skip_forward=skip_forward,
+        )
+
+    def apply_action(self, action: torch.Tensor) -> None:
+        """Apply the action to the robot."""
+        if self._ik_method == "gs_ik":
+            q_pos = self._gs_ik(action)
+        elif self._ik_method == "dls_ik":
+            q_pos = self._dls_ik(action)
+        else:
+            raise ValueError(f"Invalid control mode: {self._ik_method}")
+            
+        # extract gripper action (7th dimension) and map from [-1, 1] to [close_dof, open_dof]
+        gripper_action = action[:, 6]
+        gripper_target = (gripper_action + 1.0) / 2.0 * (self._gripper_open_dof - self._gripper_close_dof) + self._gripper_close_dof
+        
+        q_pos[:, self._left_finger_dof] = gripper_target
+        q_pos[:, self._right_finger_dof] = gripper_target
+        self._robot_entity.control_dofs_position(position=q_pos)
+
+    def _gs_ik(self, action: torch.Tensor) -> torch.Tensor:
+        """
+        Genesis inverse kinematics
+        """
+        delta_position = action[:, :3]
+        delta_orientation = action[:, 3:6]
+
+        # compute target pose
+        target_position = delta_position + self._ee_link.get_pos()
+        quat_rel = xyz_to_quat(delta_orientation, rpy=True, degrees=False)
+        target_orientation = transform_quat_by_quat(quat_rel, self._ee_link.get_quat())
+        q_pos = self._robot_entity.inverse_kinematics(
+            link=self._ee_link,
+            pos=target_position,
+            quat=target_orientation,
+            dofs_idx_local=self._arm_dof_idx,
+        )
+        return q_pos
+
+    def _dls_ik(self, action: torch.Tensor) -> torch.Tensor:
+        """
+        Damped least squares inverse kinematics.
+
+        Solves (J @ J^T + lambda^2 * I) @ y = dx, then dq = J^T @ y.
+        """
+        delta_pose = action[:, :6]
+        jacobian = self._robot_entity.get_jacobian(link=self._ee_link)
+        if self._dls_solve_on_cpu:
+            jacobian = jacobian.cpu()
+            delta_pose = delta_pose.cpu()
+        A = torch.baddbmm(self._dls_lambda_matrix, jacobian, jacobian.mT)
+        y = torch.linalg.solve(A, delta_pose)
+        delta_joint_pos = (jacobian.mT @ y.unsqueeze(-1)).squeeze(-1)
+        if self._dls_solve_on_cpu:
+            delta_joint_pos = delta_joint_pos.to(self._device)
+        return self._robot_entity.get_qpos() + delta_joint_pos
+
+    def go_to_goal(self, goal_pose: torch.Tensor, open_gripper: bool = True):
+        q_pos = self._robot_entity.inverse_kinematics(
+            link=self._ee_link,
+            pos=goal_pose[:, :3],
+            quat=goal_pose[:, 3:7],
+            dofs_idx_local=self._arm_dof_idx,
+        )
+        if open_gripper:
+            q_pos[:, self._fingers_dof] = self._gripper_open_dof
+        else:
+            q_pos[:, self._fingers_dof] = self._gripper_close_dof
+        self._robot_entity.control_dofs_position(position=q_pos)
+
+    @property
+    def base_pos(self):
+        return self._robot_entity.get_pos()
+
+    @property
+    def ee_pose(self) -> torch.Tensor:
+        """
+        The end-effector pose (the hand pose)
+        """
+        pos, quat = self._ee_link.get_pos(), self._ee_link.get_quat()
+        return torch.cat([pos, quat], dim=-1)
+
+    @property
+    def left_finger_pose(self) -> torch.Tensor:
+        pos, quat = self._left_finger_link.get_pos(), self._left_finger_link.get_quat()
+        return torch.cat([pos, quat], dim=-1)
+
+    @property
+    def right_finger_pose(self) -> torch.Tensor:
+        pos, quat = (
+            self._right_finger_link.get_pos(),
+            self._right_finger_link.get_quat(),
+        )
+        return torch.cat([pos, quat], dim=-1)
+
+    @property
+    def center_finger_pose(self) -> torch.Tensor:
+        """
+        The center finger pose is the average of the left and right finger poses.
+        """
+        left_finger_pose = self.left_finger_pose
+        right_finger_pose = self.right_finger_pose
+        center_finger_pos = (left_finger_pose[:, :3] + right_finger_pose[:, :3]) / 2
+        center_finger_quat = left_finger_pose[:, 3:7]
+        return torch.cat([center_finger_pos, center_finger_quat], dim=-1)
+
+    @property
+    def finger_tip_pose(self) -> torch.Tensor:
+        """
+        The finger tip pose, calculated by adding an offset to the center finger pose.
+        For the WidowX (wxai) arm, the forward direction (towards fingertips) is the +X axis.
+        The offset from carriage to the ee_site is roughly 7cm.
+        """
+        center_pos = self.center_finger_pose[:, :3]
+        center_quat = self.center_finger_pose[:, 3:7]
+        
+        # Local offset for finger length (roughly 7cm along X-axis)
+        local_offset = torch.tensor([0.0695, 0.0, 0.0], device=self._device)
+        local_offset = local_offset.unsqueeze(0).repeat(self._num_envs, 1)
+        
+        # Transform local offset to world frame
+        tip_pos = transform_by_trans_quat(local_offset, center_pos, center_quat)
+        
+        return torch.cat([tip_pos, center_quat], dim=-1)
