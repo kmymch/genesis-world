@@ -44,9 +44,8 @@ class GraspEnv:
         self.action_scales = torch.tensor(env_cfg["action_scales"], device=self.device)
 
         # camera config
-        self.image_width = env_cfg["image_resolution"][0]
-        self.image_height = env_cfg["image_resolution"][1]
-        self.rgb_image_shape = (3, self.image_height, self.image_width)
+        self.top_cam_res = env_cfg["top_cam_resolution"]
+        self.wrist_cam_res = env_cfg["wrist_cam_resolution"]
 
         # == determine which environments to render ==
         # Genesisは環境を ceil(sqrt(n_envs)) のグリッドで原点を中心に配置します。
@@ -116,34 +115,35 @@ class GraspEnv:
             ),
         )
 
-        # == add target region ==
-        self.target_region = self.scene.add_entity(
-            gs.morphs.Box(
-                size=[0.1, 0.1, 0.001],
-                fixed=True,
-                batch_fixed_verts=True,
-            ),
-            surface=gs.surfaces.Rough(
-                diffuse_texture=gs.textures.ColorTexture(
-                    color=(0.0, 1.0, 0.0),
+        # == add target region (optional for clean camera rendering) ==
+        if self.env_cfg.get("show_visual_helpers", True):
+            self.target_region = self.scene.add_entity(
+                gs.morphs.Box(
+                    size=[0.1, 0.1, 0.001],
+                    fixed=True,
+                    batch_fixed_verts=True,
                 ),
-            ),
-        )
-
-        # == add finger tip visualization ==
-        self.finger_tip_vis = self.scene.add_entity(
-            gs.morphs.Sphere(
-                radius=0.015,
-                fixed=True,
-                batch_fixed_verts=True,
-            ),
-            surface=gs.surfaces.Rough(
-                diffuse_texture=gs.textures.ColorTexture(
-                    color=(0.0, 0.0, 1.0),
+                surface=gs.surfaces.Rough(
+                    diffuse_texture=gs.textures.ColorTexture(
+                        color=(0.0, 1.0, 0.0),
+                    ),
                 ),
-            ),
-        )
+            )
 
+            # == add finger tip visualization ==
+            self.finger_tip_vis = self.scene.add_entity(
+                gs.morphs.Sphere(
+                    radius=0.015,
+                    fixed=True,
+                    batch_fixed_verts=True,
+                ),
+                surface=gs.surfaces.Rough(
+                    diffuse_texture=gs.textures.ColorTexture(
+                        color=(0.0, 0.0, 1.0),
+                    ),
+                ),
+            )
+        
         # == visualization camera (debug only, uses scene camera API) ==
         if self.env_cfg.get("visualize_camera", False):
             self.vis_cam = self.scene.add_camera(
@@ -163,21 +163,23 @@ class GraspEnv:
             CameraOptions = RasterizerCameraOptions
             cam_kwargs = {}
 
-        self.left_cam = self.scene.add_sensor(
+        self.top_cam = self.scene.add_sensor(
             CameraOptions(
-                res=(self.image_width, self.image_height),
-                pos=(1.25, 0.3, 0.3),
-                lookat=(0.0, 0.0, 0.0),
+                res=self.top_cam_res,
+                pos=(0.5, 0.0, 1.0),
+                lookat=(0.5, 0.0, 0.0),
                 fov=60,
                 **cam_kwargs,
             )
         )
-        self.right_cam = self.scene.add_sensor(
+        self.wrist_cam = self.scene.add_sensor(
             CameraOptions(
-                res=(self.image_width, self.image_height),
-                pos=(1.25, -0.3, 0.3),
-                lookat=(0.0, 0.0, 0.0),
+                res=self.wrist_cam_res,
+                pos=(0.05864, 0.009, 0.05427),
+                lookat=(0.156, 0.0, 0.0),
                 fov=60,
+                entity_idx=self.robot._robot_entity.idx,
+                link_idx_local=self.robot._ee_link.idx_local,
                 **cam_kwargs,
             )
         )
@@ -195,12 +197,12 @@ class GraspEnv:
         # Debug live preview of sensor cameras
         if self.env_cfg.get("visualize_camera", False):
             self.scene.start_recording(
-                data_func=partial(_read_sensor_cam, self.left_cam),
-                rec_options=gs.recorders.MPLImagePlot(title="Left Camera"),
+                data_func=partial(_read_sensor_cam, self.top_cam),
+                rec_options=gs.recorders.MPLImagePlot(title="Top Camera"),
             )
             self.scene.start_recording(
-                data_func=partial(_read_sensor_cam, self.right_cam),
-                rec_options=gs.recorders.MPLImagePlot(title="Right Camera"),
+                data_func=partial(_read_sensor_cam, self.wrist_cam),
+                rec_options=gs.recorders.MPLImagePlot(title="Wrist Camera"),
             )
 
         # == set up video recording (must be before build) ==
@@ -282,32 +284,36 @@ class GraspEnv:
         # Reset object — set_pos/set_quat with skip_forward, then FK runs once for everything
         if envs_idx is None:
             self.target_pos.copy_(random_tpos)
-            self.target_region.set_pos(random_tpos, skip_forward=True)
+            if hasattr(self, "target_region"):
+                self.target_region.set_pos(random_tpos, skip_forward=True)
             self.prev_height.fill_(0.015)
             self.prev_actions.zero_()
             
             self.goal_pose.copy_(goal_pose)
             self.object.set_pos(random_pos, skip_forward=True)
             self.object.set_quat(goal_yaw, skip_forward=False)
-            self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], skip_forward=True)
+            if hasattr(self, "finger_tip_vis"):
+                self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], skip_forward=True)
             self.episode_length_buf.zero_()
             self.reset_buf.fill_(True)
         else:
             torch.where(envs_idx[:, None], random_tpos, self.target_pos, out=self.target_pos)
-            self.target_region.set_pos(random_tpos, envs_idx=envs_idx, skip_forward=True)
+            if hasattr(self, "target_region"):
+                self.target_region.set_pos(random_tpos, envs_idx=envs_idx, skip_forward=True)
             self.prev_height.masked_fill_(envs_idx, 0.015)
             self.prev_actions[envs_idx] = 0.0
             
             torch.where(envs_idx[:, None], goal_pose, self.goal_pose, out=self.goal_pose)
             self.object.set_pos(random_pos, envs_idx=envs_idx, skip_forward=True)
             self.object.set_quat(goal_yaw, envs_idx=envs_idx, skip_forward=False)
-            self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], envs_idx=envs_idx, skip_forward=True)
+            if hasattr(self, "finger_tip_vis"):
+                self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], envs_idx=envs_idx, skip_forward=True)
             self.episode_length_buf.masked_fill_(envs_idx, 0)
             self.reset_buf.masked_fill_(envs_idx, True)
 
         # Invalidate camera caches after state change
-        self.left_cam._stale = True
-        self.right_cam._stale = True
+        self.top_cam._stale = True
+        self.wrist_cam._stale = True
 
         # Fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
@@ -333,8 +339,9 @@ class GraspEnv:
         self.robot.apply_action(actions)
         self.scene.step()
 
-        # update finger tip vis
-        self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], skip_forward=True)
+        if hasattr(self, "finger_tip_vis"):
+            # update finger tip vis
+            self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], skip_forward=True)
 
         # update time
         self.episode_length_buf += 1
@@ -384,20 +391,19 @@ class GraspEnv:
     def rescale_action(self, action: torch.Tensor) -> torch.Tensor:
         return action * self.action_scales
 
-    def get_stereo_rgb_images(self, normalize: bool = True) -> torch.Tensor:
-        rgb_left = self.left_cam.read().rgb  # (B, H, W, 3)
-        rgb_right = self.right_cam.read().rgb  # (B, H, W, 3)
+    def get_rgb_images(self, normalize: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        rgb_top = self.top_cam.read().rgb  # (B, H, W, 3)
+        rgb_wrist = self.wrist_cam.read().rgb  # (B, H, W, 3)
 
         # Convert to (B, 3, H, W) float
-        rgb_left = rgb_left.permute(0, 3, 1, 2).float()
-        rgb_right = rgb_right.permute(0, 3, 1, 2).float()
+        rgb_top = rgb_top.permute(0, 3, 1, 2).float()
+        rgb_wrist = rgb_wrist.permute(0, 3, 1, 2).float()
 
         if normalize:
-            rgb_left = rgb_left / 255.0
-            rgb_right = rgb_right / 255.0
+            rgb_top = rgb_top / 255.0
+            rgb_wrist = rgb_wrist / 255.0
 
-        # Concatenate left and right rgb images along channel dimension: [B, 6, H, W]
-        return torch.cat([rgb_left, rgb_right], dim=1)
+        return rgb_top, rgb_wrist
 
     # ------------ begin reward functions----------------
     def _reward_reach_cube(self) -> torch.Tensor:

@@ -122,10 +122,11 @@ def get_task_cfgs():
         "action_scales": [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 1.0],
         "episode_length_s": 3.0,
         "ctrl_dt": 0.01,
-        # "box_size": [0.08, 0.03, 0.06],
         "box_size": [0.03, 0.03, 0.03],
-        "image_resolution": (64, 64),
-        "visualize_camera": False,
+        "top_cam_resolution": (160, 90),
+        "wrist_cam_resolution": (160, 90),
+        "visualize_camera": True,
+        "show_visual_helpers": True,
     }
     reward_scales = {
         "reach_cube": 1.0,
@@ -177,6 +178,7 @@ def main():
 
     # === task cfgs and trainning algos cfgs ===
     env_cfg, reward_scales, robot_cfg = get_task_cfgs()
+    env_cfg["show_visual_helpers"] = args.stage != "bc"
     rl_train_cfg, bc_train_cfg = get_train_cfg(args.exp_name)
 
     # === log dir ===

@@ -20,8 +20,8 @@ class BehaviorCloning:
         self._teacher = teacher
         self._num_steps_per_env = cfg["num_steps_per_env"]
 
-        # Stereo rgb: 6 channels (3 left + 3 right)
-        rgb_shape = (6, env.image_height, env.image_width)
+        top_shape = (3, env.top_cam_res[1], env.top_cam_res[0])
+        wrist_shape = (3, env.wrist_cam_res[1], env.wrist_cam_res[0])
         action_dim = env.num_actions
 
         # Multi-task policy with action and pose heads
@@ -34,7 +34,8 @@ class BehaviorCloning:
         self._buffer = ExperienceBuffer(
             num_envs=env.num_envs,
             max_size=self._cfg["buffer_size"],
-            img_shape=rgb_shape,
+            top_shape=top_shape,
+            wrist_shape=wrist_shape,
             state_dim=self._cfg["policy"]["action_head"]["state_obs_dim"],
             action_dim=action_dim,
             device=device,
@@ -67,16 +68,16 @@ class BehaviorCloning:
             generator = self._buffer.get_batches(self._cfg.get("num_mini_batches", 4), self._cfg["num_epochs"])
             for batch in generator:
                 # Forward pass for both action and pose prediction
-                pred_action = self._policy(batch["rgb_obs"], batch["robot_pose"])
-                pred_left_pose, pred_right_pose = self._policy.predict_pose(batch["rgb_obs"])
+                pred_action = self._policy(batch["top_obs"], batch["wrist_obs"], batch["robot_pose"])
+                pred_top_pose, pred_wrist_pose = self._policy.predict_pose(batch["top_obs"], batch["wrist_obs"])
 
                 # Compute action prediction loss
                 action_loss = F.mse_loss(pred_action, batch["actions"])
 
                 # Compute pose estimation loss (position + orientation)
-                pose_left_loss = self._compute_pose_loss(pred_left_pose, batch["object_poses"])
-                pose_right_loss = self._compute_pose_loss(pred_right_pose, batch["object_poses"])
-                pose_loss = pose_left_loss + pose_right_loss
+                pose_top_loss = self._compute_pose_loss(pred_top_pose, batch["object_poses"])
+                pose_wrist_loss = self._compute_pose_loss(pred_wrist_pose, batch["object_poses"])
+                pose_loss = pose_top_loss + pose_wrist_loss
 
                 # Combined loss with weights
                 total_loss = action_loss + pose_loss
@@ -167,8 +168,8 @@ class BehaviorCloning:
         obs_dict = self._env.get_observations()
         with torch.inference_mode():
             for _ in range(self._num_steps_per_env):
-                # Get stereo rgb images
-                rgb_obs = self._env.get_stereo_rgb_images(normalize=True)
+                # Get rgb images from both cameras
+                top_obs, wrist_obs = self._env.get_rgb_images(normalize=True)
 
                 # Get teacher action
                 teacher_action = self._teacher(obs_dict).detach()
@@ -185,10 +186,10 @@ class BehaviorCloning:
                 )
 
                 # Store in buffer
-                self._buffer.add(rgb_obs, ee_pose, object_pose, teacher_action)
+                self._buffer.add(top_obs, wrist_obs, ee_pose, object_pose, teacher_action)
 
                 # Step environment with student action
-                student_action = self._policy(rgb_obs.float(), ee_pose.float())
+                student_action = self._policy(top_obs.float(), wrist_obs.float(), ee_pose.float())
 
                 # DAgger: use student action when close to teacher, otherwise fall back to teacher
                 action_diff = torch.norm(student_action - teacher_action, dim=-1)
@@ -228,7 +229,8 @@ class ExperienceBuffer:
         self,
         num_envs: int,
         max_size: int,
-        img_shape: tuple[int, int, int],
+        top_shape: tuple[int, int, int],
+        wrist_shape: tuple[int, int, int],
         state_dim: int,
         action_dim: int,
         device: str = "cpu",
@@ -236,7 +238,8 @@ class ExperienceBuffer:
     ):
         self._num_envs = num_envs
         self._max_size = max_size
-        self._img_shape = img_shape
+        self._top_shape = top_shape
+        self._wrist_shape = wrist_shape
         self._state_dim = state_dim
         self._action_dim = action_dim
         self._device = device
@@ -244,20 +247,23 @@ class ExperienceBuffer:
         self._size = 0
 
         # Buffers for data
-        self._rgb_obs = torch.empty(max_size, num_envs, *img_shape, dtype=dtype, device=device)
+        self._top_obs = torch.empty(max_size, num_envs, *top_shape, dtype=dtype, device=device)
+        self._wrist_obs = torch.empty(max_size, num_envs, *wrist_shape, dtype=dtype, device=device)
         self._robot_pose = torch.empty(max_size, num_envs, state_dim, dtype=dtype, device=device)
         self._object_poses = torch.empty(max_size, num_envs, 7, dtype=dtype, device=device)
         self._actions = torch.empty(max_size, num_envs, action_dim, dtype=dtype, device=device)
 
     def add(
         self,
-        rgb_obs: torch.Tensor,
+        top_obs: torch.Tensor,
+        wrist_obs: torch.Tensor,
         robot_pose: torch.Tensor,
         object_poses: torch.Tensor,
         actions: torch.Tensor,
     ) -> None:
         """Add experience to buffer."""
-        self._rgb_obs[self._ptr] = rgb_obs
+        self._top_obs[self._ptr] = top_obs
+        self._wrist_obs[self._ptr] = wrist_obs
         self._robot_pose[self._ptr] = robot_pose
         self._object_poses[self._ptr] = object_poses
         self._actions[self._ptr] = actions
@@ -275,7 +281,8 @@ class ExperienceBuffer:
 
                 # Yield a mini-batch of data
                 yield {
-                    "rgb_obs": self._rgb_obs[batch_indices].reshape(-1, *self._img_shape),
+                    "top_obs": self._top_obs[batch_indices].reshape(-1, *self._top_shape),
+                    "wrist_obs": self._wrist_obs[batch_indices].reshape(-1, *self._wrist_shape),
                     "robot_pose": self._robot_pose[batch_indices].reshape(-1, self._state_dim),
                     "object_poses": self._object_poses[batch_indices].reshape(-1, 7),
                     "actions": self._actions[batch_indices].reshape(-1, self._action_dim),
@@ -293,13 +300,14 @@ class ExperienceBuffer:
 
 
 class Policy(nn.Module):
-    """Multi-task behavior cloning policy with shared stereo encoder/decoder."""
+    """Multi-task behavior cloning policy with separate encoders for top and wrist cameras."""
 
     def __init__(self, config: dict, action_dim: int):
         super().__init__()
 
-        # Shared encoder for both left and right cameras
-        self.shared_encoder = self._build_cnn(config["vision_encoder"])
+        # Separate encoders for top and wrist cameras
+        self.top_encoder = self._build_cnn(config["vision_encoder"])
+        self.wrist_encoder = self._build_cnn(config["vision_encoder"])
 
         # Feature fusion layer to combine stereo features
         vision_encoder_conv_out_channels = config["vision_encoder"]["conv_layers"][-1]["out_channels"]
@@ -369,23 +377,18 @@ class Policy(nn.Module):
         layers.append(nn.Linear(mlp_input_dim, config["output_dim"]))
         return nn.Sequential(*layers)
 
-    def get_features(self, rgb_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Split stereo rgb images
-        left_rgb = rgb_obs[:, 0:3]  # First 3 channels (RGB)
-        right_rgb = rgb_obs[:, 3:6]  # Last 3 channels (RGB)
+    def get_features(self, top_obs: torch.Tensor, wrist_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        top_features = self.top_encoder(top_obs).flatten(start_dim=1)
+        wrist_features = self.wrist_encoder(wrist_obs).flatten(start_dim=1)
+        return top_features, wrist_features
 
-        # Use shared encoder for both images
-        left_features = self.shared_encoder(left_rgb).flatten(start_dim=1)
-        right_features = self.shared_encoder(right_rgb).flatten(start_dim=1)
-        return left_features, right_features
-
-    def forward(self, rgb_obs: torch.Tensor, state_obs: torch.Tensor | None = None) -> torch.Tensor:
-        """Forward pass with shared stereo encoder for rgb images."""
+    def forward(self, top_obs: torch.Tensor, wrist_obs: torch.Tensor, state_obs: torch.Tensor | None = None) -> torch.Tensor:
+        """Forward pass with separate encoders for top and wrist cameras."""
         # Get features
-        left_features, right_features = self.get_features(rgb_obs)
+        top_features, wrist_features = self.get_features(top_obs, wrist_obs)
 
         # Concatenate features (much more efficient than concatenating raw images)
-        combined_features = torch.cat([left_features, right_features], dim=-1)
+        combined_features = torch.cat([top_features, wrist_features], dim=-1)
         # Feature fusion
         fused_features = self.feature_fusion(combined_features)
 
@@ -398,9 +401,9 @@ class Policy(nn.Module):
         # Predict actions
         return self.mlp(final_features)
 
-    def predict_pose(self, rgb_obs: torch.Tensor) -> torch.Tensor:
+    def predict_pose(self, top_obs: torch.Tensor, wrist_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Predict pose from rgb images and state observations."""
-        left_features, right_features = self.get_features(rgb_obs)
-        left_pose = self.pose_mlp(left_features)
-        right_pose = self.pose_mlp(right_features)
-        return left_pose, right_pose
+        top_features, wrist_features = self.get_features(top_obs, wrist_obs)
+        top_pose = self.pose_mlp(top_features)
+        wrist_pose = self.pose_mlp(wrist_features)
+        return top_pose, wrist_pose

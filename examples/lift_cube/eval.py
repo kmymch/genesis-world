@@ -80,16 +80,19 @@ def main():
         env_cfg, reward_cfg, robot_cfg, rl_train_cfg, bc_train_cfg = pickle.load(f)
 
     env_cfg["num_envs"] = 10
+    env_cfg["top_cam_resolution"] = (160, 90)
+    env_cfg["wrist_cam_resolution"] = (160, 90)
     env_cfg["box_fixed"] = False
     env_cfg["visualize_camera"] = True
+    env_cfg["show_visual_helpers"] = args.stage != "bc"
     # env_cfg["box_size"] = [0.08, 0.03, 0.06]
     env_cfg["box_size"] = [0.03, 0.03, 0.03]
 
     if args.record:
         env_cfg["record_video"] = {
             "vis_cam": str(log_dir / (args.video_path or "video.mp4")),
-            "left_cam": str(log_dir / "left_cam.mp4"),
-            "right_cam": str(log_dir / "right_cam.mp4"),
+            "top_cam": str(log_dir / "top_cam.mp4"),
+            "wrist_cam": str(log_dir / "wrist_cam.mp4"),
         }
 
     env = GraspEnv(
@@ -115,9 +118,9 @@ def main():
             if args.stage in ["rl", "rl_lift"]:
                 actions = policy(obs_dict)
             else:
-                rgb_obs = env.get_stereo_rgb_images(normalize=True).float()
+                top_obs, wrist_obs = env.get_rgb_images(normalize=True)
                 ee_pose = env.robot.ee_pose.float()
-                actions = policy(rgb_obs, ee_pose)
+                actions = policy(top_obs.float(), wrist_obs.float(), ee_pose)
 
             obs_dict, rews, dones, infos = env.step(actions)
             
