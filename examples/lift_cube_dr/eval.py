@@ -51,7 +51,7 @@ def load_bc_policy(env, bc_cfg, log_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--exp_name", type=str, default="lift_cube")
+    parser.add_argument("-e", "--exp_name", type=str, default=Path(__file__).resolve().parent.name)
     parser.add_argument(
         "--stage",
         type=str,
