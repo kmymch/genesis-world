@@ -51,7 +51,7 @@ def load_bc_policy(env, bc_cfg, log_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--exp_name", type=str, default=Path(__file__).resolve().parent.name)
+    parser.add_argument("-e", "--exp_name", type=str, default="lift_cube")
     parser.add_argument(
         "--stage",
         type=str,
@@ -59,7 +59,6 @@ def main():
         choices=["rl", "rl_lift", "bc"],
         help="Model type: 'rl' for reinforcement learning, 'rl_lift' for lift stage, 'bc' for behavior cloning",
     )
-    parser.add_argument("-v", "--vis", action="store_true", help="Visualize with UI")
     parser.add_argument(
         "--record",
         action="store_true",
@@ -80,9 +79,11 @@ def main():
     with open(log_dir / "cfgs.pkl", "rb") as f:
         env_cfg, reward_cfg, robot_cfg, rl_train_cfg, bc_train_cfg = pickle.load(f)
 
-    env_cfg["visualize_camera"] = args.vis or args.record
     env_cfg["num_envs"] = 10
+    env_cfg["top_cam_resolution"] = (160, 90)
+    env_cfg["wrist_cam_resolution"] = (160, 90)
     env_cfg["box_fixed"] = False
+    env_cfg["visualize_camera"] = True
     env_cfg["show_visual_helpers"] = args.stage != "bc"
     # env_cfg["box_size"] = [0.08, 0.03, 0.06]
     env_cfg["box_size"] = [0.03, 0.03, 0.03]
@@ -98,7 +99,7 @@ def main():
         env_cfg=env_cfg,
         reward_cfg=reward_cfg,
         robot_cfg=robot_cfg,
-        show_viewer=args.vis,
+        show_viewer=True,
     )
 
     # Load the appropriate policy based on model type
@@ -119,9 +120,7 @@ def main():
             else:
                 top_obs, wrist_obs = env.get_rgb_images(normalize=True)
                 ee_pose = env.robot.ee_pose.float()
-                target_pos = env.target_pos.float()
-                state_obs = torch.cat([ee_pose, target_pos], dim=-1)
-                actions = policy(top_obs.float(), wrist_obs.float(), state_obs)
+                actions = policy(top_obs.float(), wrist_obs.float(), ee_pose)
 
             obs_dict, rews, dones, infos = env.step(actions)
             

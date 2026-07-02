@@ -76,6 +76,7 @@ class GraspEnv:
                 rendered_envs_idx=rendered_envs_idx, # 中央の10個を描画
                 # rendered_envs_idx=list(range(min(10, self.num_envs))), # 端から10個を描画（元のコード）
                 env_separate_rigid=True,
+                ambient_light=(0.8, 0.8, 0.8),
             ),
             viewer_options=gs.options.ViewerOptions(
                 res=(1280, 960),
@@ -136,11 +137,8 @@ class GraspEnv:
         if dummy_cfg.get("enable", False):
             # Define 5 distinct dummy objects (shape, color, size)
             dummy_specs = [
-                (gs.morphs.Sphere(radius=0.02, fixed=False), (197/255, 28/255, 28/255)),     # Red Sphere
-                (gs.morphs.Cylinder(radius=0.015, height=0.04, fixed=False), (28/255, 197/255, 60/255)), # Green Cylinder
-                (gs.morphs.Box(size=[0.02, 0.04, 0.02], fixed=False), (197/255, 197/255, 28/255)), # Yellow Box
-                (gs.morphs.Sphere(radius=0.015, fixed=False), (128/255, 0, 128/255)),        # Purple Sphere
-                (gs.morphs.Cylinder(radius=0.02, height=0.02, fixed=False), (255/255, 165/255, 0)), # Orange Cylinder
+                (gs.morphs.Box(size=[0.02, 0.04, 0.02], fixed=False), (197/255, 28/255, 28/255)), # Red Box
+                (gs.morphs.Sphere(radius=0.02, fixed=False), (255/255, 165/255, 0)),              # Orange Sphere
             ]
             for morph, color in dummy_specs:
                 dummy = self.scene.add_entity(
@@ -212,6 +210,7 @@ class GraspEnv:
                 lookat=(0.5, 0.0, 0.0),
                 up=(-1.0, 0.0, 0.0),
                 fov=60,
+                lights=[{"pos": (1.0, 1.0, 3.0), "color": (1.0, 1.0, 1.0), "intensity": 1.0}],
                 **cam_kwargs,
             )
         )
@@ -223,6 +222,7 @@ class GraspEnv:
                 fov=60,
                 entity_idx=self.robot._robot_entity.idx,
                 link_idx_local=self.robot._ee_link.idx_local,
+                lights=[{"pos": (0.0, 0.0, 1.0), "color": (1.0, 1.0, 1.0), "intensity": 1.0}],
                 **cam_kwargs,
             )
         )
@@ -256,7 +256,7 @@ class GraspEnv:
             reader = _read_scene_cam if isinstance(cam, Camera) else _read_sensor_cam
             self.scene.start_recording(
                 data_func=partial(reader, cam),
-                rec_options=gs.recorders.VideoFile(filename=filename),
+                rec_options=gs.recorders.VideoFile(filename=filename, fps=15),
             )
 
         # build
@@ -273,12 +273,8 @@ class GraspEnv:
 
         self.keypoints_offset = self.get_keypoint_offsets(batch_size=self.num_envs, device=self.device, unit_length=0.5)
         
-        # Color Jitter setup
+        # Color Jitter setup (Moved to behavior_cloning.py for batch augmentation)
         self.color_jitter = None
-        dr_cfg = env_cfg.get("domain_randomization", {})
-        if dr_cfg.get("randomize_color_jitter", False):
-            jitter_cfg = dr_cfg.get("color_jitter_params", {"brightness": 0.2, "contrast": 0.2, "saturation": 0.2, "hue": 0.05})
-            self.color_jitter = v2.ColorJitter(**jitter_cfg)
 
         # == init buffers ==
         self._init_buffers()
@@ -399,9 +395,9 @@ class GraspEnv:
         goal_pose = torch.cat([random_pos, goal_yaw], dim=-1)
 
         # Generate random target region state for all envs
-        # Put target region on the other half (x: 0.4~0.6, y: -0.4~0.4)
-        random_tx = torch.rand(self.num_envs, device=self.device) * 0.2 + 0.4
-        random_ty = (torch.rand(self.num_envs, device=self.device) - 0.5) * 0.8
+        # Put target region on the other half (x: 0.3~0.5, y: -0.3~0.3)
+        random_tx = torch.rand(self.num_envs, device=self.device) * 0.2 + 0.3
+        random_ty = (torch.rand(self.num_envs, device=self.device) - 0.5) * 0.6
         random_tz = torch.full((self.num_envs,), 0.0005, device=self.device)
         random_tpos = torch.stack([random_tx, random_ty, random_tz], dim=-1)
 
@@ -562,12 +558,7 @@ class GraspEnv:
             rgb_top = rgb_top / 255.0
             rgb_wrist = rgb_wrist / 255.0
 
-        if hasattr(self, "color_jitter") and self.color_jitter is not None:
-            # ColorJitter samples parameters once per call. To apply independent noise
-            # per environment, we iterate over the batch dimension.
-            for i in range(self.num_envs):
-                rgb_top[i] = self.color_jitter(rgb_top[i])
-                rgb_wrist[i] = self.color_jitter(rgb_wrist[i])
+
 
         return rgb_top, rgb_wrist
 

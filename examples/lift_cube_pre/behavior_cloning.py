@@ -177,11 +177,10 @@ class BehaviorCloning:
                 # Get end-effector position
                 ee_pose = self._env.robot.ee_pose
 
-                obj_pos, obj_quat = self._env.get_active_object_state()
                 object_pose = torch.cat(
                     [
-                        obj_pos,
-                        obj_quat,
+                        self._env.object.get_pos(),
+                        self._env.object.get_quat(),
                     ],
                     dim=-1,
                 )

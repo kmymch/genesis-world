@@ -76,6 +76,7 @@ dependencies = [
     "rsl-rl-lib>=5.0.0",
     "setuptools<82.0.0",
     "av>=17.1.0",
+    "pyrealsense2>=2.58.2.10647",
 ]
 
 [project.optional-dependencies]

@@ -3,7 +3,6 @@ from functools import partial
 from typing import Literal
 
 import torch
-import torchvision.transforms.v2 as v2
 from tensordict import TensorDict
 
 import genesis as gs
@@ -76,7 +75,6 @@ class GraspEnv:
                 rendered_envs_idx=rendered_envs_idx, # 中央の10個を描画
                 # rendered_envs_idx=list(range(min(10, self.num_envs))), # 端から10個を描画（元のコード）
                 env_separate_rigid=True,
-                ambient_light=(0.8, 0.8, 0.8),
             ),
             viewer_options=gs.options.ViewerOptions(
                 res=(1280, 960),
@@ -89,26 +87,10 @@ class GraspEnv:
         )
 
         # == add ground ==
-        dr_cfg = self.env_cfg.get("domain_randomization", {})
-        self.randomize_color = dr_cfg.get("randomize_color", False)
-        self.ground_pools = []
-        
-        if self.env_cfg.get("add_ground", True):
-            if self.randomize_color:
-                ground_colors = dr_cfg.get("color_patterns", {}).get("ground", [(0.8, 0.8, 0.8)])
-                for color in ground_colors:
-                    ground = self.scene.add_entity(
-                        gs.morphs.Box(size=(2.0, 2.0, 0.01), fixed=True),
-                        surface=gs.surfaces.Rough(
-                            diffuse_texture=gs.textures.ColorTexture(color=color),
-                        ),
-                    )
-                    self.ground_pools.append(ground)
-            else:
-                ground = self.scene.add_entity(
-                    gs.morphs.Plane(),
-                )
-                self.ground_pools.append(ground)
+        self.scene.add_entity(
+            gs.morphs.Plane(),
+            # gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True),
+        )
 
         # == add robot ==
         self.robot = Manipulator(
@@ -127,41 +109,17 @@ class GraspEnv:
             ),
             surface=gs.surfaces.Rough(
                 diffuse_texture=gs.textures.ColorTexture(
-                    color=(28/255, 95/255, 197/255),  # Blue
+                    # color=(1.0, 0.0, 0.0),
+                    color=(28/255, 95/255, 197/255),
                 ),
             ),
         )
 
-        # == add dummy objects for domain randomization ==
-        self.dummy_objects = []
-        dummy_cfg = dr_cfg.get("dummy_objects", {})
-        if dummy_cfg.get("enable", False):
-            # Define 5 distinct dummy objects (shape, color, size)
-            dummy_specs = [
-                (gs.morphs.Box(size=[0.02, 0.04, 0.02], fixed=False), (197/255, 28/255, 28/255)), # Red Box
-                (gs.morphs.Sphere(radius=0.02, fixed=False), (255/255, 165/255, 0)),              # Orange Sphere
-            ]
-            for morph, color in dummy_specs:
-                dummy = self.scene.add_entity(
-                    morph,
-                    surface=gs.surfaces.Rough(
-                        diffuse_texture=gs.textures.ColorTexture(color=color),
-                    ),
-                )
-                self.dummy_objects.append(dummy)
-            
-            # Add hidden plane for resting inactive dynamic dummy cubes and target cube
-            if not env_cfg.get("box_fixed", True) or len(self.dummy_objects) > 0:
-                self.scene.add_entity(
-                    gs.morphs.Box(size=(2.0, 2.0, 0.01), pos=(0, 0, -10.0), fixed=True),
-                )
-
         # == add target region (optional for clean camera rendering) ==
         if self.env_cfg.get("show_visual_helpers", True):
             self.target_region = self.scene.add_entity(
-                gs.morphs.Cylinder(
-                    radius=0.03,
-                    height=0.001,
+                gs.morphs.Box(
+                    size=[0.1, 0.1, 0.001],
                     fixed=True,
                     batch_fixed_verts=True,
                 ),
@@ -186,18 +144,16 @@ class GraspEnv:
                 ),
             )
         
-        # == visualization camera (global scene camera for recording) ==
+        # == visualization camera (debug only, uses scene camera API) ==
         if self.env_cfg.get("visualize_camera", False):
             self.vis_cam = self.scene.add_camera(
                 res=(1280, 960),
-                pos=(10.0, -4.0, 10.0),  # Scaled up version of the viewer's front-right diagonal angle
-                lookat=(0.0, 0.0, 0.0),  # Looking at the center of the grid
-                fov=60,
+                pos=(2.5, -1.0, 2.5),  # ViewerOptionsのcamera_posに合わせる
+                lookat=(0.5, -0.3, 0.1), # ViewerOptionsのcamera_lookatに合わせる
+                fov=55,
                 GUI=False,
                 debug=True,
             )
-        
-
 
         # == stereo camera sensors (lazy rendering — zero cost until read()) ==
         if _ENABLE_MADRONA and gs.backend == gs.cuda:
@@ -210,11 +166,9 @@ class GraspEnv:
         self.top_cam = self.scene.add_sensor(
             CameraOptions(
                 res=self.top_cam_res,
-                pos=(0.5, 0.0, 0.83),
+                pos=(0.5, 0.0, 1.0),
                 lookat=(0.5, 0.0, 0.0),
-                up=(-1.0, 0.0, 0.0),
                 fov=60,
-                lights=[{"pos": (1.0, 1.0, 3.0), "color": (1.0, 1.0, 1.0), "intensity": 1.0}],
                 **cam_kwargs,
             )
         )
@@ -226,7 +180,6 @@ class GraspEnv:
                 fov=60,
                 entity_idx=self.robot._robot_entity.idx,
                 link_idx_local=self.robot._ee_link.idx_local,
-                lights=[{"pos": (0.0, 0.0, 1.0), "color": (1.0, 1.0, 1.0), "intensity": 1.0}],
                 **cam_kwargs,
             )
         )
@@ -242,15 +195,15 @@ class GraspEnv:
             return cam.read(envs_idx=0).rgb
 
         # Debug live preview of sensor cameras
-        # if self.env_cfg.get("visualize_camera", False):
-        #     self.scene.start_recording(
-        #         data_func=partial(_read_sensor_cam, self.top_cam),
-        #         rec_options=gs.recorders.MPLImagePlot(title="Top Camera"),
-        #     )
-        #     self.scene.start_recording(
-        #         data_func=partial(_read_sensor_cam, self.wrist_cam),
-        #         rec_options=gs.recorders.MPLImagePlot(title="Wrist Camera"),
-        #     )
+        if self.env_cfg.get("visualize_camera", False):
+            self.scene.start_recording(
+                data_func=partial(_read_sensor_cam, self.top_cam),
+                rec_options=gs.recorders.MPLImagePlot(title="Top Camera"),
+            )
+            self.scene.start_recording(
+                data_func=partial(_read_sensor_cam, self.wrist_cam),
+                rec_options=gs.recorders.MPLImagePlot(title="Wrist Camera"),
+            )
 
         # == set up video recording (must be before build) ==
 
@@ -260,11 +213,11 @@ class GraspEnv:
             reader = _read_scene_cam if isinstance(cam, Camera) else _read_sensor_cam
             self.scene.start_recording(
                 data_func=partial(reader, cam),
-                rec_options=gs.recorders.VideoFile(filename=filename, fps=15),
+                rec_options=gs.recorders.VideoFile(filename=filename),
             )
 
         # build
-        self.scene.build(n_envs=env_cfg["num_envs"], env_spacing=(2.0, 2.0))
+        self.scene.build(n_envs=env_cfg["num_envs"], env_spacing=(1.0, 1.0))
         # set pd gains (must be called after scene.build)
         self.robot.set_pd_gains()
 
@@ -276,10 +229,6 @@ class GraspEnv:
             self.episode_sums[name] = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
         self.keypoints_offset = self.get_keypoint_offsets(batch_size=self.num_envs, device=self.device, unit_length=0.5)
-        
-        # Color Jitter setup (Moved to behavior_cloning.py for batch augmentation)
-        self.color_jitter = None
-
         # == init buffers ==
         self._init_buffers()
         self.reset()
@@ -292,17 +241,7 @@ class GraspEnv:
         self.prev_height = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
         self.prev_actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
         self.current_actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
-        self.has_lifted = torch.zeros(self.num_envs, dtype=gs.tc_bool, device=gs.device)
         self.extras = dict()
-        
-        # for object pooling
-        self.active_ground_idx = torch.zeros(self.num_envs, device=gs.device, dtype=torch.long)
-
-    def get_active_object_state(self):
-        """Helper to get the batched pos and quat of the currently active pooled objects."""
-        all_pos = self.object.get_pos()
-        all_quat = self.object.get_quat()
-        return all_pos, all_quat
 
     def _reset_idx(self, envs_idx=None) -> None:
         """Reset specified environments.
@@ -315,99 +254,10 @@ class GraspEnv:
         # Reset robot
         self.robot.reset(envs_idx)
 
-        # Object pooling randomization (color)
-        if self.randomize_color and len(self.ground_pools) > 0:
-            if envs_idx is None:
-                new_ground_idx = torch.randint(0, len(self.ground_pools), (self.num_envs,), device=self.device)
-                self.active_ground_idx.copy_(new_ground_idx)
-            else:
-                n_reset = envs_idx.sum().item() if envs_idx.dtype == torch.bool else len(envs_idx)
-                if n_reset > 0:
-                    new_ground_idx = torch.randint(0, len(self.ground_pools), (n_reset,), device=self.device)
-                    self.active_ground_idx[envs_idx] = new_ground_idx
-
-            # Teleport grounds
-            for i, ground in enumerate(self.ground_pools):
-                if envs_idx is None:
-                    is_active = (self.active_ground_idx == i)
-                    mask = is_active.unsqueeze(-1).expand(-1, 3)
-                    pos = torch.where(mask, torch.tensor([0.0, 0.0, -0.005], device=self.device), torch.tensor([0.0, 0.0, -10.0], device=self.device))
-                    ground.set_pos(pos, skip_forward=True)
-                else:
-                    is_active = (self.active_ground_idx[envs_idx] == i)
-                    mask = is_active.unsqueeze(-1).expand(-1, 3)
-                    pos = torch.where(mask, torch.tensor([0.0, 0.0, -0.005], device=self.device), torch.tensor([0.0, 0.0, -10.0], device=self.device))
-                    ground.set_pos(pos, envs_idx=envs_idx, skip_forward=True)
-
-        # Camera Jitter
-        dr_cfg = self.env_cfg.get("domain_randomization", {})
-        if dr_cfg.get("randomize_camera_jitter", False):
-            jitter_cfg = dr_cfg.get("camera_jitter", {})
-            pos_std = jitter_cfg.get("pos_std", 0.0)
-            quat_std = jitter_cfg.get("quat_std", 0.0)
-            
-            n_reset = self.num_envs if envs_idx is None else (envs_idx.sum().item() if envs_idx.dtype == torch.bool else len(envs_idx))
-
-            if not hasattr(self, "cam_pos_offset"):
-                self.cam_pos_offset = torch.zeros((self.num_envs, 3), device=self.device)
-                self.cam_quat_offset = torch.zeros((self.num_envs, 4), device=self.device)
-                self.cam_quat_offset[:, 0] = 1.0
-
-            all_envs_list = list(range(self.num_envs))
-
-            if pos_std > 0 and n_reset > 0:
-                new_pos_offset = torch.randn((n_reset, 3), device=self.device) * pos_std
-                if envs_idx is None:
-                    self.cam_pos_offset.copy_(new_pos_offset)
-                else:
-                    self.cam_pos_offset[envs_idx] = new_pos_offset
-                
-                self.top_cam.set_pos_offset(self.cam_pos_offset, envs_idx=all_envs_list)
-                self.wrist_cam.set_pos_offset(self.cam_pos_offset, envs_idx=all_envs_list)
-                
-            if quat_std > 0 and n_reset > 0:
-                xyz_noise = torch.randn((n_reset, 3), device=self.device) * quat_std
-                w = torch.ones((n_reset, 1), device=self.device)
-                new_quat_offset = torch.cat([w, xyz_noise], dim=-1)
-                new_quat_offset = new_quat_offset / torch.norm(new_quat_offset, dim=-1, keepdim=True)
-                
-                if envs_idx is None:
-                    self.cam_quat_offset.copy_(new_quat_offset)
-                else:
-                    self.cam_quat_offset[envs_idx] = new_quat_offset
-                    
-                self.top_cam.set_quat_offset(self.cam_quat_offset, envs_idx=all_envs_list)
-                self.wrist_cam.set_quat_offset(self.cam_quat_offset, envs_idx=all_envs_list)
-
-        # Generate random target region state for all envs (x: 0.2~0.6, y: -0.3~0.3)
-        random_tx = torch.rand(self.num_envs, device=self.device) * 0.4 + 0.2
-        random_ty = (torch.rand(self.num_envs, device=self.device) * 0.6) - 0.3
-        random_tz = torch.full((self.num_envs,), 0.0005, device=self.device)
-        random_tpos = torch.stack([random_tx, random_ty, random_tz], dim=-1)
-
-        # Generate random object state for all envs (x: 0.2~0.6, y: -0.3~0.3)
-        # Ensure it is completely outside the target region (dist > 0.15)
-        random_x = torch.zeros(self.num_envs, device=self.device)
-        random_y = torch.zeros(self.num_envs, device=self.device)
+        # Generate random object state for all envs
+        random_x = torch.rand(self.num_envs, device=self.device) * 0.2 + 0.1
+        random_y = (torch.rand(self.num_envs, device=self.device) - 0.5) * 0.5
         random_z = torch.full((self.num_envs,), 0.015, device=self.device)
-        
-        invalid_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
-        for _ in range(20):  # Maximum iterations to prevent infinite loop
-            if not invalid_mask.any():
-                break
-            
-            new_x = torch.rand(self.num_envs, device=self.device) * 0.4 + 0.2
-            new_y = (torch.rand(self.num_envs, device=self.device) * 0.6) - 0.3
-            
-            dist = torch.sqrt((new_x - random_tx)**2 + (new_y - random_ty)**2)
-            valid = dist > 0.15
-            
-            update_mask = invalid_mask & valid
-            random_x = torch.where(update_mask, new_x, random_x)
-            random_y = torch.where(update_mask, new_y, random_y)
-            
-            invalid_mask = invalid_mask & ~valid
-
         random_pos = torch.stack([random_x, random_y, random_z], dim=-1)
 
         q_downward = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, -1)
@@ -424,38 +274,24 @@ class GraspEnv:
         goal_yaw = transform_quat_by_quat(q_yaw, q_downward)
         goal_pose = torch.cat([random_pos, goal_yaw], dim=-1)
 
-        # Reset object — set_pos/set_quat with skip_forward, then FK runs once for everything
-        dr_cfg = self.env_cfg.get("domain_randomization", {})
-        dummy_cfg = dr_cfg.get("dummy_objects", {})
-        spawn_prob = dummy_cfg.get("spawn_prob", 0.0) if dummy_cfg.get("enable", False) else 0.0
-        n_reset = self.num_envs if envs_idx is None else (envs_idx.sum().item() if envs_idx.dtype == torch.bool else len(envs_idx))
+        # Generate random target region state for all envs
+        # Put target region on the other half (x: 0.4~0.6, y: -0.4~0.4)
+        random_tx = torch.rand(self.num_envs, device=self.device) * 0.2 + 0.4
+        random_ty = (torch.rand(self.num_envs, device=self.device) - 0.5) * 0.8
+        random_tz = torch.full((self.num_envs,), 0.0005, device=self.device)
+        random_tpos = torch.stack([random_tx, random_ty, random_tz], dim=-1)
 
+        # Reset object — set_pos/set_quat with skip_forward, then FK runs once for everything
         if envs_idx is None:
             self.target_pos.copy_(random_tpos)
             if hasattr(self, "target_region"):
                 self.target_region.set_pos(random_tpos, skip_forward=True)
             self.prev_height.fill_(0.015)
             self.prev_actions.zero_()
-            self.has_lifted.fill_(False)
             
             self.goal_pose.copy_(goal_pose)
-            
             self.object.set_pos(random_pos, skip_forward=True)
-            self.object.set_quat(goal_yaw, skip_forward=True)
-            
-            for i, dummy in enumerate(self.dummy_objects):
-                is_active = (torch.rand((self.num_envs,), device=self.device) < spawn_prob)
-                mask = is_active.unsqueeze(-1).expand(-1, 3)
-                
-                # Random position for dummies in a wider area
-                d_x = torch.rand((self.num_envs,), device=self.device) * 0.4 + 0.1
-                d_y = (torch.rand((self.num_envs,), device=self.device) - 0.5) * 0.8
-                d_z = torch.full((self.num_envs,), 0.02, device=self.device)
-                d_pos = torch.stack([d_x, d_y, d_z], dim=-1)
-                
-                pos = torch.where(mask, d_pos, torch.tensor([0.0, 0.0, -10.0], device=self.device))
-                dummy.set_pos(pos, skip_forward=(i != len(self.dummy_objects)-1))
-
+            self.object.set_quat(goal_yaw, skip_forward=False)
             if hasattr(self, "finger_tip_vis"):
                 self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], skip_forward=True)
             self.episode_length_buf.zero_()
@@ -466,26 +302,10 @@ class GraspEnv:
                 self.target_region.set_pos(random_tpos, envs_idx=envs_idx, skip_forward=True)
             self.prev_height.masked_fill_(envs_idx, 0.015)
             self.prev_actions[envs_idx] = 0.0
-            self.has_lifted.masked_fill_(envs_idx, False)
             
             torch.where(envs_idx[:, None], goal_pose, self.goal_pose, out=self.goal_pose)
-            
-            self.object.set_pos(random_pos[envs_idx], envs_idx=envs_idx, skip_forward=True)
-            self.object.set_quat(goal_yaw[envs_idx], envs_idx=envs_idx, skip_forward=True)
-            
-            for i, dummy in enumerate(self.dummy_objects):
-                is_active = (torch.rand((n_reset,), device=self.device) < spawn_prob)
-                mask = is_active.unsqueeze(-1).expand(-1, 3)
-                
-                # Random position for dummies in a wider area
-                d_x = torch.rand((n_reset,), device=self.device) * 0.4 + 0.1
-                d_y = (torch.rand((n_reset,), device=self.device) - 0.5) * 0.8
-                d_z = torch.full((n_reset,), 0.02, device=self.device)
-                d_pos = torch.stack([d_x, d_y, d_z], dim=-1)
-                
-                pos = torch.where(mask, d_pos, torch.tensor([0.0, 0.0, -10.0], device=self.device))
-                dummy.set_pos(pos, envs_idx=envs_idx, skip_forward=(i != len(self.dummy_objects)-1))
-
+            self.object.set_pos(random_pos, envs_idx=envs_idx, skip_forward=True)
+            self.object.set_quat(goal_yaw, envs_idx=envs_idx, skip_forward=False)
             if hasattr(self, "finger_tip_vis"):
                 self.finger_tip_vis.set_pos(self.robot.finger_tip_pose[:, :3], envs_idx=envs_idx, skip_forward=True)
             self.episode_length_buf.masked_fill_(envs_idx, 0)
@@ -535,10 +355,6 @@ class GraspEnv:
 
         self.current_actions = actions.clone()
 
-        # update has_lifted state
-        cube_z = self.get_active_object_state()[0][:, 2]
-        self.has_lifted |= (cube_z > 0.02)
-
         # compute reward before reset (reflects terminal state)
         reward = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
         for name, reward_func in self.reward_functions.items():
@@ -548,7 +364,7 @@ class GraspEnv:
 
         # save state before reset
         self.prev_actions = self.current_actions.clone()
-        self.prev_height = self.get_active_object_state()[0][:, 2].clone()
+        self.prev_height = self.object.get_pos()[:, 2].clone()
 
         # soft-reset envs that need it
         self._reset_idx(self.reset_buf)
@@ -557,16 +373,17 @@ class GraspEnv:
 
     def get_observations(self) -> TensorDict:
         # Current end-effector pose
-        ee_pos, ee_quat = (
+        finger_pos, finger_quat = (
             self.robot.finger_tip_pose[:, :3],
             self.robot.finger_tip_pose[:, 3:7],
         )
-        obj_pos, obj_quat = self.get_active_object_state()
+        obj_pos, obj_quat = self.object.get_pos(), self.object.get_quat()
         obs_components = [
-            ee_pos,  # 3D position
-            ee_quat,  # current orientation (w, x, y, z)
+            finger_pos - obj_pos,  # 3D position difference
+            finger_quat,  # current orientation (w, x, y, z)
             obj_pos,  # current object position
-            self.target_pos, # absolute target position
+            obj_quat,  # current object orientation (w, x, y, z)
+            self.target_pos - obj_pos, # vector to target
         ]
         self.obs_buf = torch.cat(obs_components, dim=-1)
         return TensorDict({"policy": self.obs_buf}, batch_size=[self.num_envs])
@@ -586,91 +403,63 @@ class GraspEnv:
             rgb_top = rgb_top / 255.0
             rgb_wrist = rgb_wrist / 255.0
 
-
-
         return rgb_top, rgb_wrist
 
     # ------------ begin reward functions----------------
     def _reward_reach_cube(self) -> torch.Tensor:
         # 1. Reaching to the cube reward: 1 - tanh(d/sigma)
         finger_pos = self.robot.finger_tip_pose[:, :3]
-        cube_pos = self.get_active_object_state()[0]
+        cube_pos = self.object.get_pos()
         d = torch.norm(finger_pos - cube_pos, p=2, dim=-1)
         sigma = 0.1
         return 1.0 - torch.tanh(d / sigma)
 
     def _reward_lift_cube(self) -> torch.Tensor:
-        # 2. Height tracking reward with STRONG linear gradient
-        cube_pos = self.get_active_object_state()[0]
-        z = cube_pos[:, 2]
-        dist = torch.norm(cube_pos[:, :2] - self.target_pos[:, :2], p=2, dim=-1)
+        # 2. Height reward: height > min_height
+        cube_pos = self.object.get_pos()
+        min_height = 0.025
         
-        # ターゲットから遠いとき(dist>0.1)は高さ0.2mが目標
-        # ターゲットに近いとき(dist<0.03)は高さ0.015m(床)が目標
-        dist_weight = torch.clamp((dist - 0.03) / 0.07, min=0.0, max=1.0)
-        weight = torch.where(self.has_lifted, dist_weight, torch.ones_like(dist_weight))
-        
-        # 目標高さ(desired_z): 0.015m から 0.2m (0.015 + 0.185) の間を補間
-        desired_z = 0.015 + 0.185 * weight
-        
-        # 以前上手くいっていた強力な線形勾配「(z - 0.015) * 20.0」を復活させる
-        # ただし、上限を desired_z にクリップすることで、ターゲット上空では報酬が下がるようにする
-        # torch.clampの引数型エラーを避けるため、下限はclamp、上限はtorch.minで処理
-        effective_z = torch.min(torch.clamp(z, min=0.015), desired_z)
-        dense_reward = (effective_z - 0.015) * 20.0
-        
-        # ボーナス報酬 (5mm持ち上げで+1.0)
-        bonus_reward = (z > 0.02).to(dtype=gs.tc_float)
-        
-        return dense_reward + bonus_reward
+        # 目標地點に近づいたからといって没収しないように dist > min_dist の条件を削除
+        reward = (cube_pos[:, 2] > min_height).to(dtype=gs.tc_float)
+        return reward
 
     def _reward_reach_target(self) -> torch.Tensor:
         # 3. Distance to the target region reward: 1 - tanh(d/sigma)
-        cube_pos = self.get_active_object_state()[0]
+        cube_pos = self.object.get_pos()
         target_pos = self.target_pos
         d = torch.norm(cube_pos[:, :2] - target_pos[:, :2], p=2, dim=-1)
         sigma = 0.1
-        
-        # ベース報酬を倍増(2.0)させることで、ターゲットに到達するメリットを
-        # lift_cubeの低下ペナルティよりも圧倒的に大きくする（報酬の谷を無くす）
-        base_reward = 2.0 * (1.0 - torch.tanh(d / sigma))
-        
-        # 現在の高さではなく、一度でも持ち上げた履歴を使うことで没収を防ぐ
-        return base_reward * self.has_lifted.to(dtype=gs.tc_float)
+        return 1.0 - torch.tanh(d / sigma)
 
     def _reward_lower_cube(self) -> torch.Tensor:
-        # 4. Lowering the cube reward: dense reward for being close to the ground when in target
-        cube_pos = self.get_active_object_state()[0]
+        # 4. Lowering the cube reward: dist < min_dist & height < prev_height
+        cube_pos = self.object.get_pos()
         target_pos = self.target_pos
         dist = torch.norm(cube_pos[:, :2] - target_pos[:, :2], p=2, dim=-1)
         
-        # ターゲット内にいるか
-        is_in_target_xy = (dist < 0.03).to(dtype=gs.tc_float)
+        min_dist = 0.03
         
-        # 高さが低い(0.015に近い)ほど高くなる連続報酬
-        z_diff = torch.clamp(cube_pos[:, 2] - 0.015, min=0.0)
-        lower_reward = 1.0 - torch.tanh(z_diff / 0.05)
-        
-        # ターゲット内 かつ 一度持ち上げている場合のみ有効
-        return lower_reward * is_in_target_xy * self.has_lifted.to(dtype=gs.tc_float)
+        reward = ((dist < min_dist) & (cube_pos[:, 2] < self.prev_height)).to(dtype=gs.tc_float)
+        return reward
 
     def _reward_release_cube(self) -> torch.Tensor:
-        # 5. Release cube reward: continuous reward for opening gripper when in target and lowered
-        cube_pos = self.get_active_object_state()[0]
+        # 5. Release cube reward: inside target & cube is on the floor & gripper is open
+        cube_pos = self.object.get_pos()
         target_pos = self.target_pos
         dist = torch.norm(cube_pos[:, :2] - target_pos[:, :2], p=2, dim=-1)
         
-        # ターゲット内の床に置かれているか
-        is_in_target = (dist < 0.03) & (cube_pos[:, 2] < 0.02)
+        # ターゲット内にあり、床に置かれているか
+        min_dist = 0.03
+        is_in_target = (dist < min_dist) & (cube_pos[:, 2] < 0.02)
         
-        # グリッパーの開き具合 (0.0 ~ 1.0 の連続値)
+        # グリッパーが開いているか
         q_pos = self.robot._robot_entity.get_qpos()
         gripper_pos = (q_pos[:, self.robot._left_finger_dof] + q_pos[:, self.robot._right_finger_dof]) / 2.0
         normalized_open = (gripper_pos - self.robot._gripper_close_dof) / (self.robot._gripper_open_dof - self.robot._gripper_close_dof + 1e-6)
-        normalized_open = torch.clamp(normalized_open, min=0.0, max=1.0)
+        is_open = normalized_open > 0.5
         
-        # 指を開くほど高い報酬を与える
-        return normalized_open * is_in_target.to(dtype=gs.tc_float) * self.has_lifted.to(dtype=gs.tc_float)
+        reward = (is_in_target & is_open).to(dtype=gs.tc_float)
+        return reward
 
     def _reward_action_rate(self) -> torch.Tensor:
         # 5. Action rate reward (penalty): (act - prev_act)^2

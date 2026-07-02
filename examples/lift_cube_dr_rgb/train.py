@@ -127,9 +127,8 @@ def get_task_cfgs():
         "wrist_cam_resolution": (128, 96),
         "visualize_camera": True,
         "show_visual_helpers": True,
-        "add_ground": True, # Enabled ground (default grid)
         "domain_randomization": {
-            "randomize_color": False, # Disabled color randomization to show default grid
+            "randomize_color": True,
             "randomize_camera_jitter": True,
             "randomize_color_jitter": True,
             "color_jitter_params": {
@@ -139,7 +138,7 @@ def get_task_cfgs():
                 "hue": 0.1
             },
             "dummy_objects": {
-                "enable": False, # Disabled dummy objects
+                "enable": True,
                 "spawn_prob": 0.5, # Probability of each dummy object spawning per env
             },
             "color_patterns": {
@@ -193,7 +192,7 @@ def main():
     parser.add_argument("-e", "--exp_name", type=str, default=Path(__file__).resolve().parent.name)
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     parser.add_argument("-B", "--num_envs", type=int, default=2048)
-    parser.add_argument("--max_iterations", type=int, default=1000)
+    parser.add_argument("--max_iterations", type=int, default=300)
     parser.add_argument("--stage", type=str, default="rl")
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()

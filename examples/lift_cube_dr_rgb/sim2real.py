@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as R
+import pyrealsense2 as rs
 
 import genesis as gs
 from env import GraspEnv
@@ -18,7 +19,6 @@ FOLLOWER_IP = "192.168.1.101"
 
 def init_trossen_arm():
     driver = TrossenArmDriver()
-    driver.set_manual_ip(FOLLOWER_IP)
     print(f"Connecting to Trossen Arm at {FOLLOWER_IP}...")
     driver.configure(
         model=Model.wxai_v0,
@@ -55,22 +55,33 @@ def get_ee_pose(driver):
     ee_pose = np.concatenate([pos, quat])
     return torch.tensor(ee_pose, dtype=torch.float32, device=gs.device).unsqueeze(0)
 
-def capture_image(cap, res=(64, 48)):
+def capture_image(pipeline, res=(64, 48)):
     """Capture and format image for BC policy"""
-    ret, frame = cap.read()
-    if not ret:
-        return np.zeros((3, res[1], res[0]), dtype=np.float32)
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    frame = cv2.resize(frame, res)
-    frame = np.transpose(frame, (2, 0, 1))
-    return frame.astype(np.float32) / 255.0
+    frames = pipeline.wait_for_frames()
+    color_frame = frames.get_color_frame()
+    if not color_frame:
+        return np.zeros((3, res[1], res[0]), dtype=np.float32), None
+    
+    raw_frame = np.asanyarray(color_frame.get_data())
+    frame_rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
+    frame_resized = cv2.resize(frame_rgb, res)
+    frame_tensor = np.transpose(frame_resized, (2, 0, 1))
+    
+    # Create a display image from the resized frame (upscaled for visibility)
+    disp_frame = cv2.cvtColor(frame_resized, cv2.COLOR_RGB2BGR)
+    disp_width, disp_height = res[0] * 4, res[1] * 4  # 512x384
+    disp_frame = cv2.resize(disp_frame, (disp_width, disp_height), interpolation=cv2.INTER_NEAREST)
+    
+    return frame_tensor.astype(np.float32) / 255.0, disp_frame
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default=Path(__file__).resolve().parent.name)
     parser.add_argument("--dry-run", action="store_true", help="Print actions without sending to robot")
-    parser.add_argument("--top-cam", type=int, default=0, help="Camera ID for top camera")
-    parser.add_argument("--wrist-cam", type=int, default=1, help="Camera ID for wrist camera")
+    parser.add_argument("--top-cam", type=str, default="243322072171", help="Serial number for top camera")
+    parser.add_argument("--wrist-cam", type=str, default="230422270967", help="Serial number for wrist camera")
+    parser.add_argument("--target-x", type=float, default=0.4, help="X coordinate of the target region (meters)")
+    parser.add_argument("--target-y", type=float, default=0.0, help="Y coordinate of the target region (meters)")
     args = parser.parse_args()
 
     gs.init()
@@ -104,12 +115,35 @@ def main():
         print("[DRY-RUN] Trossen Arm driver not initialized.")
         driver = None
 
-    print(f"Opening cameras (Top: {args.top_cam}, Wrist: {args.wrist_cam})...")
-    cap_top = cv2.VideoCapture(args.top_cam)
-    cap_wrist = cv2.VideoCapture(args.wrist_cam)
+    print(f"Opening cameras (Top SN: {args.top_cam}, Wrist SN: {args.wrist_cam})...")
+    ctx = rs.context()
+    
+    cap_top = rs.pipeline(ctx)
+    cfg_top = rs.config()
+    cfg_top.enable_device(args.top_cam)
+    cfg_top.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    cap_top.start(cfg_top)
+    
+    cap_wrist = rs.pipeline(ctx)
+    cfg_wrist = rs.config()
+    cfg_wrist.enable_device(args.wrist_cam)
+    cfg_wrist.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    cap_wrist.start(cfg_wrist)
+
+    print("Waiting for auto-exposure to settle...")
+    for _ in range(30):
+        cap_top.wait_for_frames()
+        cap_wrist.wait_for_frames()
 
     ctrl_dt = env_cfg["ctrl_dt"]
     max_sim_step = int(env_cfg["episode_length_s"] / ctrl_dt)
+
+    if driver:
+        print("Moving all joints to 0.0 before starting the policy...")
+        driver.set_all_positions([0.0]*7, goal_time=3.0, blocking=True)
+        time.sleep(1.0)
+        init_cartesian = driver.get_cartesian_positions()
+        print(f"Initial Cartesian Pose: pos={init_cartesian[:3]}, angle-axis={init_cartesian[3:]}")
 
     print("Starting Sim2Real control loop...")
     with torch.no_grad():
@@ -117,8 +151,17 @@ def main():
             start_time = time.time()
 
             # 1. Get Observations
-            top_img = capture_image(cap_top, res=env_cfg["top_cam_resolution"])
-            wrist_img = capture_image(cap_wrist, res=env_cfg["wrist_cam_resolution"])
+            top_img, top_disp = capture_image(cap_top, res=env_cfg["top_cam_resolution"])
+            wrist_img, wrist_disp = capture_image(cap_wrist, res=env_cfg["wrist_cam_resolution"])
+            
+            # Show images side by side
+            if top_disp is not None:
+                cv2.imshow("Top Camera (Model Input)", top_disp)
+                cv2.moveWindow("Top Camera (Model Input)", 100, 100)
+            if wrist_disp is not None:
+                cv2.imshow("Wrist Camera (Model Input)", wrist_disp)
+                # Position right next to the top camera
+                cv2.moveWindow("Wrist Camera (Model Input)", 100 + (env_cfg["top_cam_resolution"][0] * 4) + 20, 100)
             
             top_obs = torch.tensor(top_img, device=gs.device).unsqueeze(0)
             wrist_obs = torch.tensor(wrist_img, device=gs.device).unsqueeze(0)
@@ -129,8 +172,14 @@ def main():
                 # Mock EE pose for dry-run if no driver
                 ee_pose = torch.tensor([[0.5, 0.0, 0.2, 1.0, 0.0, 0.0, 0.0]], device=gs.device)
 
+            # Construct state_obs (10D: 7D ee_pose + 3D target_pos)
+            target_pos = torch.tensor([[args.target_x, args.target_y, 0.0005]], device=gs.device)
+            
+            # Combine ee_pose and target_pos into state_obs (10D)
+            state_obs = torch.cat([ee_pose, target_pos], dim=-1)
+
             # 2. Inference
-            actions = policy(top_obs, wrist_obs, ee_pose)
+            actions = policy(top_obs, wrist_obs, state_obs)
             # Genesis outputs actions scaled by action_scales, wait, env.step() multiplies by action_scales.
             # In eval.py, env.step(actions) is called. In env.py:
             # def step(self, actions: torch.Tensor):
@@ -160,7 +209,7 @@ def main():
                 # Genesis uses Hamilton product. For now, let's use scipy Rotation.
                 r_curr = R.from_rotvec(curr_aa)
                 r_rel = R.from_euler('xyz', delta_rpy) # xyz roll pitch yaw
-                r_target = r_curr * r_rel # Apply relative rotation
+                r_target = r_rel * r_curr # Match Genesis transform_quat_by_quat(quat_rel, curr_quat)
                 target_aa = r_target.as_rotvec()
 
                 target_cartesian = target_pos.tolist() + target_aa.tolist()
@@ -177,10 +226,12 @@ def main():
                 gripper_target = (gripper_action + 1.0) / 2.0 * (gripper_open - gripper_close) + gripper_close
 
                 if not args.dry_run:
+                    # Use a slightly longer goal_time to smooth out the aggressive policy actions
+                    safe_goal_time = 1.0 # Experimentally slow down to 1 second
                     driver.set_cartesian_positions(
                         goal_positions=target_cartesian,
                         interpolation_space=InterpolationSpace.cartesian,
-                        goal_time=ctrl_dt,
+                        goal_time=safe_goal_time,
                         blocking=False
                     )
                     # Note: set_gripper_position might be different
@@ -190,7 +241,7 @@ def main():
                         pass
             
             # Print state for debugging
-            if step % 10 == 0 or args.dry_run:
+            if step % 1 == 0 or args.dry_run: # print every step for 1s loop
                 print(f"Step {step}/{max_sim_step}")
                 print(f"  Actions (raw)   : {actions[0].cpu().numpy().round(3)}")
                 print(f"  Actions (scaled): {action.round(3)}")
@@ -198,13 +249,17 @@ def main():
                     print(f"  Target Cart     : {[round(v, 3) for v in target_cartesian]}")
                     print(f"  Target Gripper  : {round(gripper_target, 3)}")
 
-            # Wait to match control frequency
+            # Wait to match control frequency (Experimentally 1 second)
             elapsed = time.time() - start_time
-            if elapsed < ctrl_dt:
-                time.sleep(ctrl_dt - elapsed)
+            wait_time_ms = int((1.0 - elapsed) * 1000)
+            if wait_time_ms > 0:
+                cv2.waitKey(wait_time_ms)
+            else:
+                cv2.waitKey(1)
 
-    cap_top.release()
-    cap_wrist.release()
+    cap_top.stop()
+    cap_wrist.stop()
+    cv2.destroyAllWindows()
     print("Done.")
 
 if __name__ == "__main__":

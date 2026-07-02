@@ -123,37 +123,10 @@ def get_task_cfgs():
         "episode_length_s": 3.0,
         "ctrl_dt": 0.01,
         "box_size": [0.03, 0.03, 0.03],
-        "top_cam_resolution": (64, 48),
-        "wrist_cam_resolution": (64, 48),
+        "top_cam_resolution": (160, 90),
+        "wrist_cam_resolution": (160, 90),
         "visualize_camera": True,
         "show_visual_helpers": True,
-        "domain_randomization": {
-            "randomize_color": True,
-            "randomize_camera_jitter": True,
-            "randomize_color_jitter": True,
-            "color_jitter_params": {
-                "brightness": 0.3,
-                "contrast": 0.3,
-                "saturation": 0.3,
-                "hue": 0.1
-            },
-            "dummy_objects": {
-                "enable": True,
-                "spawn_prob": 0.5, # Probability of each dummy object spawning per env
-            },
-            "color_patterns": {
-                "ground": [
-                    (0.8, 0.8, 0.8),  # Light Gray (Defaultish)
-                    (0.5, 0.5, 0.5),  # Mid Gray
-                    (0.9, 0.8, 0.7),  # Wood-like
-                    (0.2, 0.2, 0.2),  # Dark
-                ]
-            },
-            "camera_jitter": {
-                "pos_std": 0.005,  # 5mm standard deviation for position
-                "quat_std": 0.02   # std for quaternion noise
-            }
-        }
     }
     reward_scales = {
         "reach_cube": 1.0,
@@ -192,7 +165,7 @@ def load_teacher_policy(env, rl_train_cfg, exp_name):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--exp_name", type=str, default=Path(__file__).resolve().parent.name)
+    parser.add_argument("-e", "--exp_name", type=str, default="lift_cube")
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     parser.add_argument("-B", "--num_envs", type=int, default=2048)
     parser.add_argument("--max_iterations", type=int, default=300)

@@ -1,0 +1,20 @@
+[38;5;159m[Genesis] [18:17:24] [INFO] [38;5;121m╭───────────────────────────────────────────────╮[0m[38;5;159m[0m
+[38;5;159m[Genesis] [18:17:24] [INFO] [38;5;121m│┈┉┈┉┈┉┈┉┈┉┈┉┈┉┈┉┈┉┈[0m[38;5;159m [38;5;121m[1m[3mGenesis[0m[38;5;159m [38;5;121m┈┉┈┉┈┉┈┉┈┉┈┉┈┉┈┉┈┉┈│[0m[38;5;159m[0m
+[38;5;159m[Genesis] [18:17:24] [INFO] [38;5;121m╰───────────────────────────────────────────────╯[0m[38;5;159m[0m
+[38;5;159m[Genesis] [18:17:25] [INFO] Running on [38;5;121m[4m[Intel(R) Xeon(R) w5-3423][0m[38;5;159m with backend [38;5;121m[4mgs.cpu[0m[38;5;159m. Device memory: [38;5;121m[4m62.44[0m[38;5;159m GB.[0m
+[38;5;159m[Genesis] [18:17:25] [INFO] 🚀 Genesis initialized. 🔖 version: [38;5;121m[4m1.1.2[0m[38;5;159m, 🎨 theme: [38;5;121m[4mdark[0m[38;5;159m, 🌱 seed: [38;5;121m[4mNone[0m[38;5;159m, 🐛 debug: [38;5;121m[4mFalse[0m[38;5;159m, 📏 precision: [38;5;121m[4m32[0m[38;5;159m, 🔥 performance: [38;5;121m[4mFalse[0m[38;5;159m, 💬 verbose: [38;5;121m[4mINFO[0m[38;5;159m[0m
+[38;5;159m[Genesis] [18:17:28] [INFO] Scene [38;5;121m[3m<e51ecb5>[0m[38;5;159m created.[0m
+[38;5;159m[Genesis] [18:17:28] [INFO] Adding [38;5;121m<gs.engine.entities.RigidEntity>[0m[38;5;159m. idx: [38;5;121m0[0m[38;5;159m, uid: [38;5;121m[3m<4ac2cf4>[0m[38;5;159m, morph: [38;5;121m<gs.morphs.Plane>[0m[38;5;159m, material: [38;5;121m<gs.materials.Rigid>[0m[38;5;159m.[0m
+[38;5;159m[Genesis] [18:17:28] [INFO] Adding [38;5;121m<gs.engine.entities.RigidEntity>[0m[38;5;159m. idx: [38;5;121m1[0m[38;5;159m, uid: [38;5;121m[3m<02ee24b>[0m[38;5;159m, morph: [38;5;121m<gs.morphs.MJCF(file='/home/kmymch/ws/trossen_arm_mujoco/trossen_arm_mujoco/assets/wxai/wxai_follower.xml')>[0m[38;5;159m, material: [38;5;121m<gs.materials.Rigid>[0m[38;5;159m.[0m
+[38;5;159m[Genesis] [18:17:29] [INFO] Adding [38;5;121m<gs.engine.entities.RigidEntity>[0m[38;5;159m. idx: [38;5;121m2[0m[38;5;159m, uid: [38;5;121m[3m<3671567>[0m[38;5;159m, morph: [38;5;121m<gs.morphs.Box>[0m[38;5;159m, material: [38;5;121m<gs.materials.Rigid>[0m[38;5;159m.[0m
+[38;5;159m[Genesis] [18:17:29] [INFO] Adding [38;5;121m<gs.engine.entities.RigidEntity>[0m[38;5;159m. idx: [38;5;121m3[0m[38;5;159m, uid: [38;5;121m[3m<0627681>[0m[38;5;159m, morph: [38;5;121m<gs.morphs.Cylinder>[0m[38;5;159m, material: [38;5;121m<gs.materials.Rigid>[0m[38;5;159m.[0m
+[38;5;159m[Genesis] [18:17:29] [INFO] Adding [38;5;121m<gs.engine.entities.RigidEntity>[0m[38;5;159m. idx: [38;5;121m4[0m[38;5;159m, uid: [38;5;121m[3m<052272f>[0m[38;5;159m, morph: [38;5;121m<gs.morphs.Sphere>[0m[38;5;159m, material: [38;5;121m<gs.materials.Rigid>[0m[38;5;159m.[0m
+[38;5;159m[Genesis] [18:17:29] [INFO] Building scene [38;5;121m[3m<e51ecb5>[0m[38;5;159m...[0m
+[38;5;226m[Genesis] [18:17:30] [WARNING] Filtered out geometry pairs causing self-collision for the neutral configuration (qpos0): (2, 6), (11, 14), (11, 15), (11, 16), (12, 14), (12, 15), (12, 16), (13, 14), (13, 15). Consider tuning Morph option 'decompose_robot_error_threshold' or specify dedicated collision meshes. This behavior can be disabled by setting Morph option 'enable_neutral_collision=True'.[0m
+[38;5;226m[Genesis] [18:17:31] [WARNING] Rasterizer with n_envs > 1 is slow as it doesn't do batched rendering consider using BatchRenderer instead.[0m
+[38;5;159m[Genesis] [18:17:31] [INFO] Compiling simulation kernels...[0m
+[38;5;159m[Genesis] [18:17:34] [INFO] Building visualizer...[0m
+Sim EE Pos: [0.0977 0.     0.1635]
+Sim EE Quat (wxyz): [1. 0. 0. 0.]
+Sim TCP Pos: [0.2537 0.     0.1635]
+[38;5;159m[Genesis] [18:17:34] [INFO] 💤 Exiting Genesis and caching compiled kernels...[0m

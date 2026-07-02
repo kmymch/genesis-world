@@ -59,6 +59,7 @@ def main():
         choices=["rl", "rl_lift", "bc"],
         help="Model type: 'rl' for reinforcement learning, 'rl_lift' for lift stage, 'bc' for behavior cloning",
     )
+    parser.add_argument("-v", "--vis", action="store_true", help="Visualize with UI")
     parser.add_argument(
         "--record",
         action="store_true",
@@ -80,10 +81,8 @@ def main():
         env_cfg, reward_cfg, robot_cfg, rl_train_cfg, bc_train_cfg = pickle.load(f)
 
     env_cfg["num_envs"] = 10
-    env_cfg["top_cam_resolution"] = (64, 48)
-    env_cfg["wrist_cam_resolution"] = (64, 48)
     env_cfg["box_fixed"] = False
-    env_cfg["visualize_camera"] = True
+    env_cfg["visualize_camera"] = args.vis or args.record
     env_cfg["show_visual_helpers"] = args.stage != "bc"
     # env_cfg["box_size"] = [0.08, 0.03, 0.06]
     env_cfg["box_size"] = [0.03, 0.03, 0.03]
@@ -99,7 +98,7 @@ def main():
         env_cfg=env_cfg,
         reward_cfg=reward_cfg,
         robot_cfg=robot_cfg,
-        show_viewer=True,
+        show_viewer=args.vis,
     )
 
     # Load the appropriate policy based on model type
@@ -120,7 +119,9 @@ def main():
             else:
                 top_obs, wrist_obs = env.get_rgb_images(normalize=True)
                 ee_pose = env.robot.ee_pose.float()
-                actions = policy(top_obs.float(), wrist_obs.float(), ee_pose)
+                target_pos = env.target_pos.float()
+                state_obs = torch.cat([ee_pose, target_pos], dim=-1)
+                actions = policy(top_obs.float(), wrist_obs.float(), state_obs)
 
             obs_dict, rews, dones, infos = env.step(actions)
             

@@ -194,7 +194,7 @@ class BehaviorCloning:
                 teacher_action = self._teacher(obs_dict).detach()
 
                 # Get end-effector position and target region position
-                ee_pose = self._env.robot.finger_tip_pose
+                ee_pose = self._env.robot.ee_pose
                 target_pos = self._env.target_pos
                 state_obs = torch.cat([ee_pose, target_pos], dim=-1)
 
@@ -241,7 +241,7 @@ class BehaviorCloning:
         for _ in range(self._env.max_episode_length):
             top_obs, wrist_obs = self._env.get_rgb_images(normalize=True)
             
-            ee_pose = self._env.robot.finger_tip_pose
+            ee_pose = self._env.robot.ee_pose
             target_pos = self._env.target_pos
             state_obs = torch.cat([ee_pose, target_pos], dim=-1)
             
